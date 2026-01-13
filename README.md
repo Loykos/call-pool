@@ -6,16 +6,18 @@ HTTP request pool with rate limiting, quotas, automatic retry, and adaptive thro
 
 ## Why CallPool?
 
-Managing thousands of requests against rate-limited APIs is hard. Native fetch or simple loops often lead to 429 errors, socket exhaustion, or local memory spikes.
+Managing thousands of requests against rate-limited APIs is hard. Native `fetch` or simple `undici` requests loops often lead to **429 errors**, **socket exhaustion**, or **local memory spikes**.
 
-CallPool orchestrates your outbound traffic, giving you precise control over concurrency, quotas, and retries in a single, ready-to-use tool. Instead of manually glueing together multiple libraries, you get a managed pipeline that respects server limits and automatically adjusts to upstream pressure.
+**CallPool orchestrates your outbound traffic**, giving you precise control over concurrency, quotas, throttling and retries in a single, ready-to-use tool.
+
+The tool uses a **Real-Time Adaptive Throttling** feature (based on the **EMA algorithm**) that gives you the ability to detect upstream congestion and adjust the request rate in real-time to protect your throughput.
 
 ## Features
 
 -   **HTTP Connection Pool**: Uses [`undici`](https://github.com/nodejs/undici) to efficiently manage TCP connections
 -   **Rate Limiting**: Leverages [`bottleneck`](https://github.com/SGrondin/bottleneck) for precise quota management, supporting both fixed windows and "auto" distribution
 -   **Adaptive Throttling**: Real-time latency monitoring. It automatically slows down when the upstream service starts to lag, preventing 429s and timeouts
--   **Automatic Retry**: Integrated with [`p-retry`](https://github.com/sindresorhus/p-retry) for exponential backoff, network and server errors
+-   **Automatic Retry**: Integrated with [`p-retry`](https://github.com/sindresorhus/p-retry) for exponential backoff, network and server errors, including `Retry-After` header support
 
 ## Installation
 
