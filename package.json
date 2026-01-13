@@ -1,0 +1,37 @@
+{
+    "name": "call-pool",
+    "version": "0.0.0",
+    "description": "HTTP request pool con rate limiting, retry e adaptive throttling",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "scripts": {
+        "build": "tsc",
+        "prepublishOnly": "pnpm build",
+        "publish": "pnpm publish",
+        "demo": "tsx demo.ts",
+        "test": "tsx test.ts"
+    },
+    "keywords": [
+        "http",
+        "pool",
+        "rate-limit",
+        "throttle",
+        "retry",
+        "undici"
+    ],
+    "author": "",
+    "license": "MIT",
+    "dependencies": {
+        "bottleneck": "^2.19.5",
+        "p-retry": "^6.2.0",
+        "undici": "^6.19.8"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "tsx": "^4.7.0",
+        "typescript": "^5.0.0"
+    },
+    "peerDependencies": {
+        "typescript": "^5.0.0"
+    }
+}
