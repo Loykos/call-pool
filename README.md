@@ -1,27 +1,27 @@
 # CallPool
 
-HTTP request pool con rate limiting, retry automatico e adaptive throttling per Node.js.
+HTTP request pool with rate limiting, quotas, automatic retry, and adaptive throttling for Node.js.
 
-## Caratteristiche
+## Features
 
--   **Pool di connessioni HTTP**: Utilizza `undici` per gestire efficientemente le connessioni TCP
--   **Rate Limiting**: Configurabile con quota e finestre temporali
--   **Adaptive Throttling**: Rallenta automaticamente quando rileva congestione
--   **Retry automatico**: Retry con backoff esponenziale per errori di rete e server
--   **Priorità delle richieste**: Sistema di code con priorità (0-9)
--   **TypeScript**: Completamente tipizzato
+-   **HTTP Connection Pool**: Uses `undici` to efficiently manage TCP connections
+-   **Rate Limiting**: Configurable with quotas and time windows
+-   **Adaptive Throttling**: Automatically slows down when congestion is detected
+-   **Automatic Retry**: Retry with exponential backoff for network and server errors
+-   **Request Priority**: Queue system with priority levels (0-9)
+-   **TypeScript**: Fully typed
 
-## Installazione
+## Installation
 
 ```bash
 pnpm install call-pool
 ```
 
-## Esempi
+## Examples
 
-### Esempio Minimal
+### Minimal Example
 
-Configurazione minima con solo l'URL base. Usa i valori di default per tutte le opzioni.
+Minimal configuration with only the base URL. Uses default values for all options.
 
 ```typescript
 import { CallPool } from "call-pool";
@@ -34,9 +34,9 @@ const data = await pool.request("/endpoint");
 await pool.close();
 ```
 
-### Esempio con Throttling e Quota
+### Throttling and Quota Example
 
-Per servizi con limiti di rate (es. API esterne con quota contrattuale). Il pool distribuisce automaticamente le richieste nella finestra temporale.
+For services with rate limits (e.g., external APIs with contractual quotas). The pool automatically distributes requests across the time window.
 
 ```typescript
 import { CallPool } from "call-pool";
@@ -44,20 +44,20 @@ import { CallPool } from "call-pool";
 const pool = new CallPool({
     baseUrl: "https://api.external-service.com",
     concurrency: {
-        limit: 5, // Massimo 5 richieste simultanee
+        limit: 5, // Maximum 5 concurrent requests
     },
     rateLimit: {
-        minTime: "auto", // Calcola automaticamente il delay dalla quota
+        minTime: "auto", // Automatically calculates delay from quota
         quota: {
-            max: 100, // 100 richieste
-            window: 60000, // in 60 secondi (1 minuto)
+            max: 100, // 100 requests
+            window: 60000, // in 60 seconds (1 minute)
         },
-        congestionThreshold: 2.5, // Rallenta se latenza > 2.5x la media
+        congestionThreshold: 2.5, // Slow down if latency > 2.5x the average
     },
     retry: {
-        maxAttempts: 5, // Più tentativi per servizi esterni
-        delay: 2000, // 2 secondi di attesa iniziale
-        factor: 2, // Backoff esponenziale: 2s, 4s, 8s, 16s, 32s
+        maxAttempts: 5, // More attempts for external services
+        delay: 2000, // 2 seconds initial wait
+        factor: 2, // Exponential backoff: 2s, 4s, 8s, 16s, 32s
     },
 });
 
@@ -65,9 +65,9 @@ const result = await pool.request("/api/data");
 await pool.close();
 ```
 
-### Esempio Full Configuration
+### Full Configuration Example
 
-Configurazione completa con tutte le opzioni settate esplicitamente.
+Complete configuration with all options explicitly set.
 
 ```typescript
 import { CallPool } from "call-pool";
@@ -75,23 +75,23 @@ import { CallPool } from "call-pool";
 const pool = new CallPool({
     baseUrl: "https://api.example.com",
     concurrency: {
-        limit: 20, // 20 richieste simultanee
+        limit: 20, // 20 concurrent requests
     },
     rateLimit: {
-        minTime: 50, // 50ms tra ogni richiesta (oppure "auto" se usi quota)
+        minTime: 50, // 50ms between each request (or "auto" if using quota)
         quota: {
-            max: 1000, // 1000 richieste
-            window: 3600000, // in 1 ora
+            max: 1000, // 1000 requests
+            window: 3600000, // in 1 hour
         },
-        congestionThreshold: 2.0, // Soglia per adaptive throttling
+        congestionThreshold: 2.0, // Threshold for adaptive throttling
     },
     retry: {
-        maxAttempts: 3, // Massimo 3 tentativi
-        delay: 1000, // 1 secondo di delay iniziale
+        maxAttempts: 3, // Maximum 3 attempts
+        delay: 1000, // 1 second initial delay
         factor: 2, // Backoff: 1s, 2s, 4s
     },
     network: {
-        timeout: 30000, // 30 secondi di timeout
+        timeout: 30000, // 30 seconds timeout
         defaultHeaders: {
             Authorization: "Bearer your-token-here",
             "User-Agent": "MyApp/1.0",
@@ -100,13 +100,13 @@ const pool = new CallPool({
     },
 });
 
-// Esempi di utilizzo
+// Usage examples
 const users = await pool.request<User[]>("/users");
 
 const newUser = await pool.request<User>("/users", {
     method: "POST",
     body: { name: "John", email: "john@example.com" },
-    priority: 9, // Priorità alta
+    priority: 9, // High priority
 });
 
 const urgent = await pool.request("/urgent", {
@@ -120,7 +120,7 @@ const urgent = await pool.request("/urgent", {
 await pool.close();
 ```
 
-## Utilizzo Base
+## Basic Usage
 
 ```typescript
 import { CallPool } from "call-pool";
@@ -134,7 +134,7 @@ const pool = new CallPool({
         minTime: "auto",
         quota: {
             max: 100,
-            window: 60000, // 100 richieste al minuto
+            window: 60000, // 100 requests per minute
         },
     },
     retry: {
@@ -159,58 +159,58 @@ const newUser = await pool.request<User>("/users", {
     body: { name: "John", email: "john@example.com" },
 });
 
-// Richiesta con priorità alta
+// High priority request
 const urgent = await pool.request("/urgent", {
     priority: 9,
 });
 
-// Chiudi il pool quando hai finito
+// Close the pool when done
 await pool.close();
 ```
 
-## Configurazione
+## Configuration
 
 ### CallPoolOptions
 
--   `baseUrl` (obbligatorio): URL base per tutte le richieste
--   `concurrency.limit`: Numero massimo di richieste simultanee (default: 10)
--   `rateLimit.minTime`: Tempo minimo tra richieste in ms, oppure `"auto"` per calcolo automatico
--   `rateLimit.quota`: Quota contrattuale (es. 100 richieste al minuto)
--   `rateLimit.congestionThreshold`: Soglia per adaptive throttling (default: 2.0)
--   `retry.maxAttempts`: Numero massimo di tentativi (default: 3)
--   `retry.delay`: Ritardo base per retry in ms (default: 1000)
--   `retry.factor`: Fattore di backoff esponenziale (default: 2)
--   `network.timeout`: Timeout per singola richiesta in ms (default: 30000)
--   `network.defaultHeaders`: Headers da includere in ogni richiesta
+-   `baseUrl` (required): Base URL for all requests
+-   `concurrency.limit`: Maximum number of concurrent requests (default: 10)
+-   `rateLimit.minTime`: Minimum time between requests in ms, or `"auto"` for automatic calculation
+-   `rateLimit.quota`: Contractual quota (e.g., 100 requests per minute)
+-   `rateLimit.congestionThreshold`: Threshold for adaptive throttling (default: 2.0)
+-   `retry.maxAttempts`: Maximum number of attempts (default: 3)
+-   `retry.delay`: Base delay for retry in ms (default: 1000)
+-   `retry.factor`: Exponential backoff factor (default: 2)
+-   `network.timeout`: Timeout for single request in ms (default: 30000)
+-   `network.defaultHeaders`: Headers to include in every request
 
 ### RequestOptions
 
--   `method`: Metodo HTTP (GET, POST, PUT, DELETE, ecc.)
--   `priority`: Priorità nella coda (0-9, default: 5, 9 è la più alta)
--   `body`: Body della richiesta (può essere oggetto JS, verrà serializzato automaticamente)
--   `headers`: Headers aggiuntivi per la singola richiesta
+-   `method`: HTTP method (GET, POST, PUT, DELETE, etc.)
+-   `priority`: Queue priority (0-9, default: 5, 9 is highest)
+-   `body`: Request body (can be a JS object, will be automatically serialized)
+-   `headers`: Additional headers for the single request
 
 ## Adaptive Throttling
 
-Il pool monitora automaticamente la latenza delle richieste e rallenta quando rileva congestione:
+The pool automatically monitors request latency and slows down when congestion is detected:
 
--   Calcola una media mobile esponenziale (EMA) della latenza
--   Se una richiesta è più lenta della media moltiplicata per `congestionThreshold`, aumenta il delay
--   Quando le richieste tornano veloci, ripristina il delay originale
+-   Calculates an exponential moving average (EMA) of latency
+-   If a request is slower than the average multiplied by `congestionThreshold`, it increases the delay
+-   When requests become fast again, it restores the original delay
 
-## Gestione Errori
+## Error Handling
 
--   **429 (Rate Limit)**: Rileva automaticamente `Retry-After` header e attende
--   **5xx (Server Error)**: Retry automatico
--   **4xx (Client Error)**: Non viene fatto retry (AbortError)
--   **Network Error**: Retry automatico
+-   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits
+-   **5xx (Server Error)**: Automatic retry
+-   **4xx (Client Error)**: No retry is performed (AbortError)
+-   **Network Error**: Automatic retry
 
-## Dipendenze
+## Dependencies
 
--   `undici`: Pool di connessioni HTTP ad alte prestazioni
--   `bottleneck`: Rate limiting e gestione code
--   `p-retry`: Retry con backoff esponenziale
+-   `undici`: High-performance HTTP connection pool
+-   `bottleneck`: Rate limiting and queue management
+-   `p-retry`: Retry with exponential backoff
 
-## Licenza
+## License
 
 MIT
