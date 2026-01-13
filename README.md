@@ -1,15 +1,21 @@
 # CallPool
 
+[![license](https://img.shields.io/npm/l/call-pool)](https://github.com/Loykos/call-pool/blob/main/LICENSE)
+
 HTTP request pool with rate limiting, quotas, automatic retry, and adaptive throttling for Node.js.
+
+## Why CallPool?
+
+Managing thousands of requests against rate-limited APIs is hard. Native fetch or simple loops often lead to 429 errors, socket exhaustion, or local memory spikes.
+
+CallPool orchestrates your outbound traffic, giving you precise control over concurrency, quotas, and retries in a single, ready-to-use tool. Instead of manually glueing together multiple libraries, you get a managed pipeline that respects server limits and automatically adjusts to upstream pressure.
 
 ## Features
 
--   **HTTP Connection Pool**: Uses `undici` to efficiently manage TCP connections
--   **Rate Limiting**: Configurable with quotas and time windows
--   **Adaptive Throttling**: Automatically slows down when congestion is detected
--   **Automatic Retry**: Retry with exponential backoff for network and server errors
--   **Request Priority**: Queue system with priority levels (0-9)
--   **TypeScript**: Fully typed
+-   **HTTP Connection Pool**: Uses [`undici`](https://github.com/nodejs/undici) to efficiently manage TCP connections
+-   **Rate Limiting**: Leverages [`bottleneck`](https://github.com/SGrondin/bottleneck) for precise quota management, supporting both fixed windows and "auto" distribution
+-   **Adaptive Throttling**: Real-time latency monitoring. It automatically slows down when the upstream service starts to lag, preventing 429s and timeouts
+-   **Automatic Retry**: Integrated with [`p-retry`](https://github.com/sindresorhus/p-retry) for exponential backoff, network and server errors
 
 ## Installation
 
@@ -101,11 +107,12 @@ const pool = new CallPool({
 });
 
 // Usage examples
+// JSON parsing is automatic when Content-Type is application/json
 const users = await pool.request<User[]>("/users");
 
 const newUser = await pool.request<User>("/users", {
     method: "POST",
-    body: { name: "John", email: "john@example.com" },
+    body: { name: "John", email: "john@example.com" }, // Automatically serialized to JSON
     priority: 9, // High priority
 });
 
@@ -120,75 +127,128 @@ const urgent = await pool.request("/urgent", {
 await pool.close();
 ```
 
-## Basic Usage
+## Configuration
+
+### Base Configuration
+
+| Option    | Type     | Required | Default | Description               |
+| --------- | -------- | -------- | ------- | ------------------------- |
+| `baseUrl` | `string` | Yes      | -       | Base URL for all requests |
+
+### Concurrency Configuration
+
+| Option              | Type     | Required | Default | Description                           |
+| ------------------- | -------- | -------- | ------- | ------------------------------------- |
+| `concurrency.limit` | `number` | No       | `10`    | Maximum number of concurrent requests |
+
+### Rate Limit Configuration
+
+| Option                          | Type               | Required | Default | Description                                                                                   |
+| ------------------------------- | ------------------ | -------- | ------- | --------------------------------------------------------------------------------------------- |
+| `rateLimit.minTime`             | `number \| "auto"` | No       | `0`     | Minimum time between requests in ms, or `"auto"` for automatic calculation (requires `quota`) |
+| `rateLimit.quota.max`           | `number`           | No       | -       | Maximum number of requests allowed in the time window                                         |
+| `rateLimit.quota.window`        | `number`           | No       | -       | Time window in ms (e.g., 60000 for 1 minute)                                                  |
+| `rateLimit.congestionThreshold` | `number`           | No       | `2.0`   | Threshold for adaptive throttling. If latency > average × threshold, the pool slows down      |
+
+### Retry Configuration
+
+| Option              | Type     | Required | Default | Description                                         |
+| ------------------- | -------- | -------- | ------- | --------------------------------------------------- |
+| `retry.maxAttempts` | `number` | No       | `3`     | Maximum number of retry attempts                    |
+| `retry.delay`       | `number` | No       | `1000`  | Base delay in ms before the first retry             |
+| `retry.factor`      | `number` | No       | `2`     | Exponential backoff factor (delay × factor^attempt) |
+
+### Network Configuration
+
+| Option                   | Type                     | Required | Default | Description                         |
+| ------------------------ | ------------------------ | -------- | ------- | ----------------------------------- |
+| `network.timeout`        | `number`                 | No       | `30000` | Timeout for single request in ms    |
+| `network.defaultHeaders` | `Record<string, string>` | No       | `{}`    | Headers to include in every request |
+
+## Request
+
+Options for individual requests passed to the `request()` method.
+
+**Note**: JSON parsing is automatic. If the response `Content-Type` header contains `application/json`, the response body is automatically parsed as JSON. Otherwise, it returns the raw text. Request bodies that are JavaScript objects are automatically serialized to JSON with the appropriate `Content-Type` header.
+
+### Example
 
 ```typescript
-import { CallPool } from "call-pool";
-
 const pool = new CallPool({
     baseUrl: "https://api.example.com",
-    concurrency: {
-        limit: 10,
-    },
-    rateLimit: {
-        minTime: "auto",
-        quota: {
-            max: 100,
-            window: 60000, // 100 requests per minute
-        },
-    },
-    retry: {
-        maxAttempts: 3,
-        delay: 1000,
-        factor: 2,
-    },
-    network: {
-        timeout: 30000,
-        defaultHeaders: {
-            Authorization: "Bearer token",
-        },
+});
+
+// GET request with high priority
+const data = await pool.request("/data", {
+    priority: 9,
+});
+
+// POST request with custom headers
+// Body objects are automatically serialized to JSON
+const result = await pool.request("/users", {
+    method: "POST",
+    body: { name: "John", email: "john@example.com" },
+    headers: {
+        "X-Custom-Header": "value",
     },
 });
 
-// GET request
-const users = await pool.request<User[]>("/users");
+// PUT request
+// Response JSON is automatically parsed when Content-Type is application/json
+await pool.request("/users/123", {
+    method: "PUT",
+    body: { name: "Jane" },
+});
+```
 
-// POST request
+### TypeScript Types
+
+The `request()` method supports TypeScript generics for full type safety:
+
+```typescript
+// Define your types
+interface User {
+    id: number;
+    name: string;
+    email: string;
+}
+
+interface ApiResponse<T> {
+    data: T;
+    status: string;
+}
+
+const pool = new CallPool({
+    baseUrl: "https://api.example.com",
+});
+
+// Type-safe request - TypeScript infers the return type
+const users = await pool.request<User[]>("/users");
+// users is typed as User[]
+
+const user = await pool.request<User>("/users/123");
+// user is typed as User
+
+const response = await pool.request<ApiResponse<User>>("/users/123");
+// response is typed as ApiResponse<User>
+// response.data is typed as User
+
+// POST with typed response
 const newUser = await pool.request<User>("/users", {
     method: "POST",
     body: { name: "John", email: "john@example.com" },
 });
-
-// High priority request
-const urgent = await pool.request("/urgent", {
-    priority: 9,
-});
-
-// Close the pool when done
-await pool.close();
+// newUser is typed as User
 ```
 
-## Configuration
+### Options
 
-### CallPoolOptions
-
--   `baseUrl` (required): Base URL for all requests
--   `concurrency.limit`: Maximum number of concurrent requests (default: 10)
--   `rateLimit.minTime`: Minimum time between requests in ms, or `"auto"` for automatic calculation
--   `rateLimit.quota`: Contractual quota (e.g., 100 requests per minute)
--   `rateLimit.congestionThreshold`: Threshold for adaptive throttling (default: 2.0)
--   `retry.maxAttempts`: Maximum number of attempts (default: 3)
--   `retry.delay`: Base delay for retry in ms (default: 1000)
--   `retry.factor`: Exponential backoff factor (default: 2)
--   `network.timeout`: Timeout for single request in ms (default: 30000)
--   `network.defaultHeaders`: Headers to include in every request
-
-### RequestOptions
-
--   `method`: HTTP method (GET, POST, PUT, DELETE, etc.)
--   `priority`: Queue priority (0-9, default: 5, 9 is highest)
--   `body`: Request body (can be a JS object, will be automatically serialized)
--   `headers`: Additional headers for the single request
+| Option     | Type                                               | Required | Default | Description                                                    |
+| ---------- | -------------------------------------------------- | -------- | ------- | -------------------------------------------------------------- |
+| `method`   | `HttpMethod`                                       | No       | `"GET"` | HTTP method (GET, POST, PUT, DELETE, etc.)                     |
+| `priority` | `number`                                           | No       | `5`     | Queue priority (0-9, 9 is highest)                             |
+| `body`     | `string \| Buffer \| Uint8Array \| object \| null` | No       | -       | Request body (JS objects are automatically serialized to JSON) |
+| `headers`  | `Record<string, string>`                           | No       | -       | Additional headers for the single request                      |
 
 ## Adaptive Throttling
 
