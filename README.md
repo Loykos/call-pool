@@ -60,6 +60,7 @@ const pool = new CallPool({
             max: 100, // 100 requests
             window: 60000, // in 60 seconds (1 minute)
         },
+        enableAdaptiveThrottling: true, // Enable adaptive throttling
         congestionThreshold: 2.5, // Slow down if latency > 2.5x the average
     },
     retry: {
@@ -91,6 +92,7 @@ const pool = new CallPool({
             max: 1000, // 1000 requests
             window: 3600000, // in 1 hour
         },
+        enableAdaptiveThrottling: true, // Enable adaptive throttling
         congestionThreshold: 2.0, // Threshold for adaptive throttling
     },
     retry: {
@@ -141,16 +143,17 @@ await pool.close();
 
 | Option              | Type     | Required | Default | Description                           |
 | ------------------- | -------- | -------- | ------- | ------------------------------------- |
-| `concurrency.limit` | `number` | No       | `10`    | Maximum number of concurrent requests |
+| `concurrency.limit` | `number` | No       | `1`     | Maximum number of concurrent requests |
 
 ### Rate Limit Configuration
 
-| Option                          | Type               | Required | Default | Description                                                                                   |
-| ------------------------------- | ------------------ | -------- | ------- | --------------------------------------------------------------------------------------------- |
-| `rateLimit.minTime`             | `number \| "auto"` | No       | `0`     | Minimum time between requests in ms, or `"auto"` for automatic calculation (requires `quota`) |
-| `rateLimit.quota.max`           | `number`           | No       | -       | Maximum number of requests allowed in the time window                                         |
-| `rateLimit.quota.window`        | `number`           | No       | -       | Time window in ms (e.g., 60000 for 1 minute)                                                  |
-| `rateLimit.congestionThreshold` | `number`           | No       | `2.0`   | Threshold for adaptive throttling. If latency > average × threshold, the pool slows down      |
+| Option                               | Type               | Required | Default | Description                                                                                                                                      |
+| ------------------------------------ | ------------------ | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `rateLimit.minTime`                  | `number \| "auto"` | No       | `0`     | Minimum time between requests in ms, or `"auto"` for automatic calculation (requires `quota`)                                                    |
+| `rateLimit.quota.max`                | `number`           | No       | -       | Maximum number of requests allowed in the time window                                                                                            |
+| `rateLimit.quota.window`             | `number`           | No       | -       | Time window in ms (e.g., 60000 for 1 minute)                                                                                                     |
+| `rateLimit.enableAdaptiveThrottling` | `boolean`          | No       | `false` | Enable adaptive throttling based on latency monitoring                                                                                           |
+| `rateLimit.congestionThreshold`      | `number`           | No       | `2.0`   | Threshold for adaptive throttling. If latency > average × threshold, the pool slows down. Only effective if `enableAdaptiveThrottling` is `true` |
 
 ### Retry Configuration
 
@@ -254,7 +257,9 @@ const newUser = await pool.request<User>("/users", {
 
 ## Adaptive Throttling
 
-The pool automatically monitors request latency and slows down when congestion is detected:
+Adaptive throttling is **disabled by default**. To enable it, set `rateLimit.enableAdaptiveThrottling` to `true`.
+
+When enabled, the pool automatically monitors request latency and slows down when congestion is detected:
 
 -   Calculates an exponential moving average (EMA) of latency
 -   If a request is slower than the average multiplied by `congestionThreshold`, it increases the delay
@@ -272,6 +277,17 @@ The pool automatically monitors request latency and slows down when congestion i
 -   `undici`: High-performance HTTP connection pool
 -   `bottleneck`: Rate limiting and queue management
 -   `p-retry`: Retry with exponential backoff
+
+## TODO
+
+Funzionalità pianificate per le prossime versioni:
+
+-   **Sistema di monitoraggio UI locale**: Interfaccia web avviata localmente per monitorare in tempo reale:
+    -   Velocità di scodamento delle richieste per ogni pool
+    -   Log delle richieste e degli errori
+    -   Latenze medie, minime e massime per ogni pool
+    -   Statistiche su rate limiting, retry e throttling
+    -   Grafici e metriche in tempo reale
 
 ## License
 

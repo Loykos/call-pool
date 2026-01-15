@@ -40,11 +40,33 @@ export interface CallPoolOptions {
             window: number; // es. 60000 (ms)
         };
 
+        /** * Abilita il rallentamento automatico basato sulla latenza (Adaptive Throttling).
+         * Se abilitato, il pool monitora la latenza e rallenta quando rileva congestione.
+         * Default: false
+         */
+        enableAdaptiveThrottling?: boolean;
+
         /** * Soglia di latenza per il rallentamento automatico (Adaptive Throttling).
          * Se una richiesta è X volte più lenta della media, il pool rallenta temporaneamente.
+         * Ha effetto solo se `enableAdaptiveThrottling` è true.
          * Default: 2.0
          */
         congestionThreshold?: number;
+
+        /** * Fattore di riduzione per il soft landing (Adaptive Throttling).
+         * Quando la congestione si risolve, il pool riduce gradualmente il delay moltiplicandolo per questo fattore.
+         * Valore tra 0 e 1 (es. 0.8 = riduzione del 20%).
+         * Ha effetto solo se `enableAdaptiveThrottling` è true.
+         * Default: 0.8
+         */
+        recoveryFactor?: number;
+
+        /** * Valore massimo configurabile per minTime durante l'Adaptive Throttling.
+         * Quando il pool rileva congestione, può aumentare minTime fino a questo valore.
+         * Ha effetto solo se `enableAdaptiveThrottling` è true.
+         * Default: 5000
+         */
+        maxMinTime?: number;
     };
 
     /** Configurazione Resilienza (Retry) */
@@ -87,16 +109,23 @@ export class CallPool {
     private retryOptions: PRetryOptions;
     private requestTimeout: number;
     private defaultHeaders: Record<string, string>;
+    private enableAdaptiveThrottling: boolean;
     private congestionThreshold: number;
+    private recoveryFactor: number;
+    private maxMinTime: number;
 
     // Adaptive State
     private avgLatency: number = 0;
     private baseMinTime: number;
+    private currentMinTime: number;
 
     constructor(options: CallPoolOptions) {
         // Defaults
-        const concurrencyLimit = options.concurrency?.limit ?? 10;
+        const concurrencyLimit = options.concurrency?.limit ?? 1;
+        this.enableAdaptiveThrottling = options.rateLimit?.enableAdaptiveThrottling ?? false;
         this.congestionThreshold = options.rateLimit?.congestionThreshold ?? 2.0;
+        this.recoveryFactor = options.rateLimit?.recoveryFactor ?? 0.8;
+        this.maxMinTime = options.rateLimit?.maxMinTime ?? 5000;
         this.requestTimeout = options.network?.timeout ?? 30_000;
         this.defaultHeaders = options.network?.defaultHeaders ?? {};
 
@@ -118,6 +147,8 @@ export class CallPool {
         } else {
             this.baseMinTime = rateOpts?.minTime ?? 0;
         }
+
+        this.currentMinTime = this.baseMinTime;
 
         // --- 2. SETUP UNDICI (Network Layer) ---
         this.client = new Pool(options.baseUrl, {
@@ -194,15 +225,18 @@ export class CallPool {
                 throw err;
             }
 
-            // 2. Adaptive Logic (Aggiornamento latenza e throttling)
-            const duration = Date.now() - start;
-            this.updateThrottleLogic(duration);
-
-            // 3. Status Code Handling
+            // 2. Status Code Handling
             if (response.statusCode === 429) {
+                // Non aggiorniamo throttling per 429: è un rate limit esplicito, non un problema di latenza
                 const retryAfter = Number(response.headers["retry-after"]) || 5;
                 await this.forceWait(retryAfter * 1000);
                 throw new Error(`Rate Limit Hit (429)`);
+            }
+
+            // 3. Adaptive Logic (Aggiornamento latenza e throttling)
+            const duration = Date.now() - start;
+            if (this.enableAdaptiveThrottling && duration > 100) {
+                this.updateThrottleLogic(duration);
             }
 
             if (response.statusCode >= 500) {
@@ -239,33 +273,40 @@ export class CallPool {
         // Se la durata attuale è molto sopra la media -> Congestione -> Rallenta
         if (duration > this.avgLatency * this.congestionThreshold) {
             this.increaseDelay();
-        } else if (duration < this.avgLatency) {
-            // Se siamo veloci -> Recupera velocità (Soft landing)
+        } else if (this.currentMinTime > this.baseMinTime) {
+            // Soft landing: se non c'è congestione E siamo ancora rallentati, recupera gradualmente
+            // Non serve controllare duration < avgLatency perché se non c'è congestione, possiamo recuperare
             this.decreaseDelay();
         }
     }
 
     private increaseDelay() {
-        const currentMinTime = this.baseMinTime || 50;
-        // Triplica l'attesa (o almeno 200ms)
-        const newMinTime = Math.max(currentMinTime * 3, 200);
+        // Moltiplichiamo il ritardo ATTUALE, non quello base, per scalare se la congestione persiste
+        // Cap massimo configurabile per non "uccidere" il pool
+        const nextDelay = Math.max(this.currentMinTime * 2, 200);
+        this.currentMinTime = Math.min(nextDelay, this.maxMinTime);
 
-        // Applico solo se serve (evito chiamate inutili a bottleneck)
-        // Nota: Bottleneck non espone un getter sync per settings, quindi lo facciamo blind.
-        this.limiter.updateSettings({ minTime: newMinTime });
+        this.limiter.updateSettings({ minTime: this.currentMinTime });
     }
 
     private decreaseDelay() {
-        // Torniamo al valore base definito nel costruttore
-        this.limiter.updateSettings({ minTime: this.baseMinTime });
+        // Riduciamo gradualmente usando il recoveryFactor invece di resettare subito
+        const nextDelay = this.currentMinTime * this.recoveryFactor;
+
+        // Non scendiamo mai sotto il baseMinTime definito dall'utente
+        this.currentMinTime = Math.max(nextDelay, this.baseMinTime);
+
+        this.limiter.updateSettings({ minTime: this.currentMinTime });
     }
 
     private async forceWait(ms: number) {
-        // Pausa forzata
-        this.limiter.updateSettings({ minTime: ms });
+        // Aspetta il tempo indicato da Retry-After header
+        // Bottleneck gestisce rate limiting, p-retry gestisce il retry
         await new Promise(r => setTimeout(r, ms));
-        // Reset
-        this.limiter.updateSettings({ minTime: this.baseMinTime });
+    }
+
+    public getCurrentMinTime() {
+        return this.currentMinTime;
     }
 
     /** Chiude pool e limiter per liberare le risorse */
