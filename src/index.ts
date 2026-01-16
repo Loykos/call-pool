@@ -25,7 +25,7 @@ export interface CallPoolOptions {
     };
 
     /** * Dynamic Configuration (Adaptive Throttling / Network Awareness).
-     * Manages speed based on actual server latency.
+     * Manages CONCURRENCY based on actual server latency.
      */
     adaptive?: {
         /** * Enables dynamic throttling.
@@ -60,20 +60,14 @@ export interface CallPoolOptions {
          */
         breachLimit?: number;
 
-        /** [AIMD] Additive Increase: How many ms to add to delay in congestion. Default: 50 */
+        /** [AIMD] Additive Increase: How many CONNECTIONS to add in recovery. Default: 1 */
         increaseStep?: number;
 
-        /** [AIMD] Multiplicative Decrease: Reduction factor (0-1) in recovery. Default: 0.9 */
+        /** [AIMD] Multiplicative Decrease: Reduction factor (0-1) for concurrency in congestion. Default: 0.9 */
         decreaseFactor?: number;
 
-        /** Maximum ceiling for calculated minTime (ms). Default: 5000 */
-        maxMinTime?: number;
-
-        /** Minimum ms between two configuration updates (Debounce). Default: 250 */
-        tuningDebounce?: number;
-
-        /** Minimum % variation needed to apply a settings change. Default: 0.05 (5%) */
-        tuningPercent?: number;
+        /** Lower bound for concurrency. The algorithm will never go below this. Default: 1 */
+        minConcurrency?: number;
     };
 
     /** Retry Configuration (Resilience) */
@@ -117,22 +111,23 @@ export class CallPool {
     private breachLimit: number;
     private increaseStep: number;
     private decreaseFactor: number;
-    private maxMinTime: number;
+
+    // Adaptive Bounds
+    private minConcurrency: number;
+    private maxConcurrency: number; // Initialized to concurrency.limit
 
     // Tuning Config
     private tuningDebounce: number;
-    private tuningPercent: number;
 
     // Adaptive State
     private lastSettingsUpdate: number = -Infinity;
     private pendingUpdateTimer: NodeJS.Timeout | null = null;
-    private pendingMinTime: number | null = null;
+    private pendingConcurrency: number | null = null;
     private avgLatency: number = 0;
     private congestionHits: number = 0;
 
     // Limiter State
-    private baseMinTime: number;
-    private currentMinTime: number;
+    private currentConcurrency: number;
 
     constructor(options: CallPoolOptions) {
         const concurrencyLimit = options.concurrency?.limit ?? 10;
@@ -145,12 +140,15 @@ export class CallPool {
         this.adaptiveIgnoreBelow = adaptOpts?.ignoreBelow ?? 100;
         this.congestionRatio = adaptOpts?.congestionRatio ?? 2.0;
         this.breachLimit = adaptOpts?.breachLimit ?? 2;
-        this.increaseStep = adaptOpts?.increaseStep ?? 50;
+        this.increaseStep = adaptOpts?.increaseStep ?? 1;
         this.decreaseFactor = adaptOpts?.decreaseFactor ?? 0.9;
-        this.maxMinTime = adaptOpts?.maxMinTime ?? 5000;
 
-        this.tuningDebounce = adaptOpts?.tuningDebounce ?? 250;
-        this.tuningPercent = adaptOpts?.tuningPercent ?? 0.05;
+        // Adaptive Bounds Setup (Sanitized)
+        this.minConcurrency = Math.max(1, Math.floor(adaptOpts?.minConcurrency ?? 1));
+        this.maxConcurrency = Math.min(concurrencyLimit, concurrencyLimit);
+        if (this.maxConcurrency < this.minConcurrency) this.maxConcurrency = this.minConcurrency;
+
+        this.tuningDebounce = 250;
 
         // --- 2. NETWORK & RETRY CONFIGURATION ---
         this.requestTimeout = options.network?.timeout ?? 30_000;
@@ -163,24 +161,30 @@ export class CallPool {
         };
 
         // --- 3. BASE MINTIME CALCULATION ---
+        let baseMinTime = 0;
         if (rateOpts?.minTime === "auto") {
             if (!rateOpts.quota) throw new Error("[CallPool] 'auto' requires 'quota'");
-            this.baseMinTime = Math.ceil(rateOpts.quota.window / rateOpts.quota.max);
+            baseMinTime = Math.ceil(rateOpts.quota.window / rateOpts.quota.max);
         } else {
-            this.baseMinTime = rateOpts?.minTime ?? 0;
+            baseMinTime = rateOpts?.minTime ?? 0;
         }
-        this.currentMinTime = this.baseMinTime;
+
+        // --- 3.1 CONCURRENCY SETUP ---
+        // Start at the maximum allowed by adaptive logic
+        this.currentConcurrency = this.maxConcurrency;
 
         // --- 4. SETUP UNDICI & BOTTLENECK ---
+        // Undici Pool needs the HARD limit (total sockets available)
         this.client = new Pool(options.baseUrl, {
             connections: concurrencyLimit,
             pipelining: 1,
             keepAliveTimeout: 10_000,
         });
 
+        // Bottleneck starts with the current adaptive concurrency
         this.limiter = new Bottleneck({
-            maxConcurrent: concurrencyLimit,
-            minTime: this.baseMinTime,
+            maxConcurrent: this.currentConcurrency,
+            minTime: baseMinTime,
             reservoir: rateOpts?.quota?.max ?? null,
             reservoirRefreshAmount: rateOpts?.quota?.max ?? null,
             reservoirRefreshInterval: rateOpts?.quota?.window ?? null,
@@ -250,8 +254,6 @@ export class CallPool {
             }
 
             // Adaptive Logic Hook
-            // FILTER: We only measure Success (2xx/3xx).
-            // We ignore 4xx (often fast failures) and 5xx (server faults, handled by retry).
             if (this.adaptiveEnabled && measuredDuration > 0 && statusCode < 400) {
                 this.updateThrottleLogic(measuredDuration);
             }
@@ -290,7 +292,7 @@ export class CallPool {
         // A. Low Latency Guard
         if (duration < this.adaptiveIgnoreBelow) {
             this.congestionHits = 0;
-            if (this.currentMinTime > this.baseMinTime) this.decreaseDelay();
+            if (this.currentConcurrency < this.maxConcurrency) this.increaseConcurrency();
             return;
         }
 
@@ -299,35 +301,41 @@ export class CallPool {
             this.congestionHits++;
             if (this.congestionHits >= this.breachLimit) {
                 this.congestionHits = 0; // RESET
-                this.increaseDelay();
+                this.reduceConcurrency();
             }
         } else {
             // C. Recovery
             this.congestionHits = 0;
-            if (this.currentMinTime > this.baseMinTime) {
-                this.decreaseDelay();
+            if (this.currentConcurrency < this.maxConcurrency) {
+                this.increaseConcurrency();
             }
         }
     }
 
-    private increaseDelay() {
-        const nextDelay = Math.min(this.currentMinTime + this.increaseStep, this.maxMinTime);
-        this.applyNewSettings(nextDelay);
+    private reduceConcurrency() {
+        // AIMD Decrease: Multiplicative factor OR at least -1 connection
+        const nextRaw = Math.min(this.currentConcurrency * this.decreaseFactor, this.currentConcurrency - 1);
+
+        // Clamp to safety floor
+        const nextConcurrency = Math.max(nextRaw, this.minConcurrency);
+
+        this.applyNewSettings(nextConcurrency);
     }
 
-    private decreaseDelay() {
-        const nextDelay = Math.max(this.currentMinTime * this.decreaseFactor, this.baseMinTime);
-        this.applyNewSettings(nextDelay);
+    private increaseConcurrency() {
+        const nextConcurrency = Math.min(this.currentConcurrency + this.increaseStep, this.maxConcurrency);
+        this.applyNewSettings(nextConcurrency);
     }
 
-    private applyNewSettings(newMinTime: number) {
-        newMinTime = Math.ceil(newMinTime);
+    private applyNewSettings(newConcurrency: number) {
+        newConcurrency = Math.floor(newConcurrency);
+        if (newConcurrency === this.currentConcurrency) return;
 
         // 1. THRESHOLD Check
-        const diff = Math.abs(newMinTime - this.currentMinTime);
-        const percentThreshold = this.currentMinTime > 0 ? this.currentMinTime * this.tuningPercent : 10;
+        const diff = Math.abs(newConcurrency - this.currentConcurrency);
+        const percentThreshold = this.currentConcurrency > 0 ? this.currentConcurrency : 1;
 
-        if (diff < Math.max(10, percentThreshold)) return;
+        if (diff < Math.max(1, percentThreshold)) return;
 
         // 2. DEBOUNCE & TRAILING Logic
         const now = performance.now();
@@ -335,10 +343,10 @@ export class CallPool {
 
         if (timeSinceLastUpdate >= this.tuningDebounce) {
             // Immediate update
-            this.performUpdate(newMinTime);
+            this.performUpdate(newConcurrency);
         } else {
             // Delayed update (Trailing)
-            this.pendingMinTime = newMinTime;
+            this.pendingConcurrency = newConcurrency;
 
             if (!this.pendingUpdateTimer) {
                 const waitMs = this.tuningDebounce - timeSinceLastUpdate;
@@ -346,8 +354,8 @@ export class CallPool {
                 this.pendingUpdateTimer = setTimeout(() => {
                     this.pendingUpdateTimer = null;
 
-                    const value = this.pendingMinTime;
-                    this.pendingMinTime = null;
+                    const value = this.pendingConcurrency;
+                    this.pendingConcurrency = null;
 
                     if (value !== null) {
                         this.performUpdate(value);
@@ -362,11 +370,11 @@ export class CallPool {
             clearTimeout(this.pendingUpdateTimer);
             this.pendingUpdateTimer = null;
         }
-        this.pendingMinTime = null;
+        this.pendingConcurrency = null;
 
-        this.currentMinTime = value;
+        this.currentConcurrency = value;
         this.lastSettingsUpdate = performance.now();
-        this.limiter.updateSettings({ minTime: this.currentMinTime });
+        this.limiter.updateSettings({ maxConcurrent: this.currentConcurrency });
     }
 
     private async forceWait(ms: number) {
