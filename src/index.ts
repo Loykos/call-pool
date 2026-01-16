@@ -1,99 +1,98 @@
 import { Pool, Dispatcher } from "undici";
 import Bottleneck from "bottleneck";
 import pRetry, { AbortError, Options as PRetryOptions } from "p-retry";
+import { performance } from "perf_hooks";
 
 // ==========================================
 // CONFIGURATION TYPES
 // ==========================================
 
 export interface CallPoolOptions {
-    /** L'URL base per tutte le richieste (es. "https://api.example.com") */
+    /** Base URL for all requests (e.g. "https://api.example.com") */
     baseUrl: string;
 
-    /** * Configurazione del parallelismo (Il "Tubo").
-     * Gestisce quante richieste vengono aperte simultaneamente.
-     */
+    /** Concurrency Configuration (Socket/Queue) */
     concurrency?: {
-        /** * Numero massimo di richieste simultanee.
-         * Configura sia i socket TCP di Undici che la coda logica.
-         * Default: 10
-         */
-        limit?: number;
+        limit?: number; // Default: 10
     };
 
-    /** * Configurazione della frequenza e limiti (Il "Freno").
-     * Gestisce la velocità e le quote.
-     */
+    /** Static Configuration (Contractual Rate Limit) */
     rateLimit?: {
-        /**
-         * Tempo minimo di attesa tra due richieste in ms.
-         * - Se `number`: Attesa fissa (es. 50ms).
-         * - Se `"auto"`: Calcola automaticamente l'attesa per distribuire la quota uniformemente.
-         * (Richiede che `quota` sia definito).
-         * Default: 0
-         */
+        /** Minimum time between requests. If "auto", requires `quota`. */
         minTime?: number | "auto";
+        /** Defined quota (e.g. 100 req / 60000ms) */
+        quota?: { max: number; window: number };
+    };
 
-        /** Quota contrattuale (es. 100 richieste al minuto) */
-        quota?: {
-            max: number; // es. 100
-            window: number; // es. 60000 (ms)
-        };
-
-        /** * Abilita il rallentamento automatico basato sulla latenza (Adaptive Throttling).
-         * Se abilitato, il pool monitora la latenza e rallenta quando rileva congestione.
+    /** * Dynamic Configuration (Adaptive Throttling / Network Awareness).
+     * Manages speed based on actual server latency.
+     */
+    adaptive?: {
+        /** * Enables dynamic throttling.
          * Default: false
          */
-        enableAdaptiveThrottling?: boolean;
+        enabled?: boolean;
 
-        /** * Soglia di latenza per il rallentamento automatico (Adaptive Throttling).
-         * Se una richiesta è X volte più lenta della media, il pool rallenta temporaneamente.
-         * Ha effetto solo se `enableAdaptiveThrottling` è true.
+        /**
+         * true: Measures only TTFB (Time To First Byte). Great for variable payloads.
+         * false: Measures complete download.
+         * Default: true
+         */
+        useTTFB?: boolean;
+
+        /**
+         * Minimum duration threshold (ms). If request lasts less than X, it's ignored.
+         * Default: 100ms
+         */
+        ignoreBelow?: number;
+
+        /**
+         * Average multiplier to define congestion.
+         * E.g. 2.0 = If latency > 2x average, we consider it congestion.
          * Default: 2.0
          */
-        congestionThreshold?: number;
+        congestionRatio?: number;
 
-        /** * Fattore di riduzione per il soft landing (Adaptive Throttling).
-         * Quando la congestione si risolve, il pool riduce gradualmente il delay moltiplicandolo per questo fattore.
-         * Valore tra 0 e 1 (es. 0.8 = riduzione del 20%).
-         * Ha effetto solo se `enableAdaptiveThrottling` è true.
-         * Default: 0.8
+        /**
+         * How many consecutive times congestion must be detected before slowing down.
+         * Filters outliers (e.g. GC spikes or isolated packet loss).
+         * Default: 2
          */
-        recoveryFactor?: number;
+        breachLimit?: number;
 
-        /** * Valore massimo configurabile per minTime durante l'Adaptive Throttling.
-         * Quando il pool rileva congestione, può aumentare minTime fino a questo valore.
-         * Ha effetto solo se `enableAdaptiveThrottling` è true.
-         * Default: 5000
-         */
+        /** [AIMD] Additive Increase: How many ms to add to delay in congestion. Default: 50 */
+        increaseStep?: number;
+
+        /** [AIMD] Multiplicative Decrease: Reduction factor (0-1) in recovery. Default: 0.9 */
+        decreaseFactor?: number;
+
+        /** Maximum ceiling for calculated minTime (ms). Default: 5000 */
         maxMinTime?: number;
+
+        /** Minimum ms between two configuration updates (Debounce). Default: 250 */
+        tuningDebounce?: number;
+
+        /** Minimum % variation needed to apply a settings change. Default: 0.05 (5%) */
+        tuningPercent?: number;
     };
 
-    /** Configurazione Resilienza (Retry) */
+    /** Retry Configuration (Resilience) */
     retry?: {
-        /** Numero massimo di tentativi. Default: 3 */
         maxAttempts?: number;
-        /** Ritardo base in ms prima del primo retry. Default: 1000 */
         delay?: number;
-        /** Fattore di backoff esponenziale (1s -> 2s -> 4s). Default: 2 */
         factor?: number;
     };
 
-    /** Opzioni Generiche di Rete */
+    /** Undici Network Options */
     network?: {
-        /** Timeout del socket per singola richiesta in ms. Default: 30000 */
         timeout?: number;
-        /** Headers da includere in ogni richiesta */
         defaultHeaders?: Record<string, string>;
     };
 }
 
-/** Opzioni per la singola richiesta */
 export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin" | "path" | "method" | "body"> {
     method?: Dispatcher.HttpMethod;
-    /** Priorità nella coda (0-9, default 5). 9 è la più alta. */
     priority?: number;
-    /** Override manuale del body (accetta anche oggetti JS diretti) */
     body?: string | Buffer | Uint8Array | Record<string, any> | null;
 }
 
@@ -109,23 +108,51 @@ export class CallPool {
     private retryOptions: PRetryOptions;
     private requestTimeout: number;
     private defaultHeaders: Record<string, string>;
-    private enableAdaptiveThrottling: boolean;
-    private congestionThreshold: number;
-    private recoveryFactor: number;
+
+    // Adaptive Config (Flattened for perf)
+    private adaptiveEnabled: boolean;
+    private useTTFB: boolean;
+    private adaptiveIgnoreBelow: number;
+    private congestionRatio: number;
+    private breachLimit: number;
+    private increaseStep: number;
+    private decreaseFactor: number;
     private maxMinTime: number;
 
+    // Tuning Config
+    private tuningDebounce: number;
+    private tuningPercent: number;
+
     // Adaptive State
+    private lastSettingsUpdate: number = -Infinity;
+    private pendingUpdateTimer: NodeJS.Timeout | null = null;
+    private pendingMinTime: number | null = null;
     private avgLatency: number = 0;
+    private congestionHits: number = 0;
+
+    // Limiter State
     private baseMinTime: number;
     private currentMinTime: number;
 
     constructor(options: CallPoolOptions) {
-        // Defaults
-        const concurrencyLimit = options.concurrency?.limit ?? 1;
-        this.enableAdaptiveThrottling = options.rateLimit?.enableAdaptiveThrottling ?? false;
-        this.congestionThreshold = options.rateLimit?.congestionThreshold ?? 2.0;
-        this.recoveryFactor = options.rateLimit?.recoveryFactor ?? 0.8;
-        this.maxMinTime = options.rateLimit?.maxMinTime ?? 5000;
+        const concurrencyLimit = options.concurrency?.limit ?? 10;
+        const rateOpts = options.rateLimit;
+        const adaptOpts = options.adaptive;
+
+        // --- 1. ADAPTIVE CONFIGURATION ---
+        this.adaptiveEnabled = adaptOpts?.enabled ?? false;
+        this.useTTFB = adaptOpts?.useTTFB ?? true;
+        this.adaptiveIgnoreBelow = adaptOpts?.ignoreBelow ?? 100;
+        this.congestionRatio = adaptOpts?.congestionRatio ?? 2.0;
+        this.breachLimit = adaptOpts?.breachLimit ?? 2;
+        this.increaseStep = adaptOpts?.increaseStep ?? 50;
+        this.decreaseFactor = adaptOpts?.decreaseFactor ?? 0.9;
+        this.maxMinTime = adaptOpts?.maxMinTime ?? 5000;
+
+        this.tuningDebounce = adaptOpts?.tuningDebounce ?? 250;
+        this.tuningPercent = adaptOpts?.tuningPercent ?? 0.05;
+
+        // --- 2. NETWORK & RETRY CONFIGURATION ---
         this.requestTimeout = options.network?.timeout ?? 30_000;
         this.defaultHeaders = options.network?.defaultHeaders ?? {};
 
@@ -135,43 +162,29 @@ export class CallPool {
             factor: options.retry?.factor ?? 2,
         };
 
-        // --- 1. CALCOLO minTime ("AUTO" vs MANUAL) ---
-        const rateOpts = options.rateLimit;
-
+        // --- 3. BASE MINTIME CALCULATION ---
         if (rateOpts?.minTime === "auto") {
-            if (!rateOpts.quota) {
-                throw new Error("[CallPool] Configuration Error: Cannot set minTime to 'auto' without defining a 'quota'.");
-            }
-            // Distribuisce le chiamate equamente nella finestra temporale
+            if (!rateOpts.quota) throw new Error("[CallPool] 'auto' requires 'quota'");
             this.baseMinTime = Math.ceil(rateOpts.quota.window / rateOpts.quota.max);
         } else {
             this.baseMinTime = rateOpts?.minTime ?? 0;
         }
-
         this.currentMinTime = this.baseMinTime;
 
-        // --- 2. SETUP UNDICI (Network Layer) ---
+        // --- 4. SETUP UNDICI & BOTTLENECK ---
         this.client = new Pool(options.baseUrl, {
             connections: concurrencyLimit,
             pipelining: 1,
             keepAliveTimeout: 10_000,
         });
 
-        // --- 3. SETUP BOTTLENECK (Control Layer) ---
         this.limiter = new Bottleneck({
-            // Concurrency
             maxConcurrent: concurrencyLimit,
-
-            // Rate Limiting (Calculated or Manual)
             minTime: this.baseMinTime,
-
-            // Quota / Reservoir (Se presente)
             reservoir: rateOpts?.quota?.max ?? null,
             reservoirRefreshAmount: rateOpts?.quota?.max ?? null,
             reservoirRefreshInterval: rateOpts?.quota?.window ?? null,
-
-            // Queue Strategy
-            strategy: Bottleneck.strategy.BLOCK, // Blocca nuove aggiunte se la coda è piena
+            strategy: Bottleneck.strategy.BLOCK,
             highWater: 10_000,
         });
 
@@ -180,39 +193,32 @@ export class CallPool {
 
     private setupMonitoring() {
         this.limiter.on("error", err => {
-            // Errori interni al limiter (es. Redis disconnesso se usato in cluster)
             if (process.env.NODE_ENV !== "production") console.error("[CallPool] Limiter Error:", err);
         });
     }
 
-    /**
-     * Esegue una richiesta HTTP gestita dal pool.
-     * @param path Path relativo (es. "/users")
-     * @param options Opzioni della richiesta
-     */
     public async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T> {
         const { priority = 5, ...reqOpts } = options;
-
         return this.limiter.schedule({ priority }, () => this.executeWithRetry<T>(path, reqOpts));
     }
 
-    /** Logica Core: Retry, Request, Parsing, Adaptive Logic */
     private async executeWithRetry<T>(path: string, reqOpts: Omit<RequestOptions, "priority">): Promise<T> {
         return pRetry(async () => {
-            const start = Date.now();
+            const start = performance.now();
             let response: Dispatcher.ResponseData;
+            let rawBody: string;
+            let measuredDuration = 0;
 
-            // 1. Prepare Request
             try {
                 let body = reqOpts.body;
                 const headers = { ...this.defaultHeaders, ...reqOpts.headers } as Record<string, string>;
 
-                // Auto-JSON stringify
                 if (body && typeof body === "object" && !Buffer.isBuffer(body) && !(body instanceof Uint8Array)) {
                     body = JSON.stringify(body);
                     if (!headers["Content-Type"]) headers["Content-Type"] = "application/json";
                 }
 
+                // Request
                 response = await this.client.request({
                     path,
                     method: reqOpts.method || "GET",
@@ -220,97 +226,158 @@ export class CallPool {
                     body: body as string | Buffer | Uint8Array | null,
                     headersTimeout: this.requestTimeout,
                 });
+
+                // Measure TTFB
+                if (this.useTTFB) measuredDuration = performance.now() - start;
+
+                // Download
+                rawBody = await response.body.text();
+
+                // Measure Total (Fallback)
+                if (!this.useTTFB) measuredDuration = performance.now() - start;
             } catch (err) {
-                // Network error puro -> Retry
+                // Network Error -> Retry
                 throw err;
             }
 
-            // 2. Status Code Handling
-            if (response.statusCode === 429) {
-                // Non aggiorniamo throttling per 429: è un rate limit esplicito, non un problema di latenza
-                const retryAfter = Number(response.headers["retry-after"]) || 5;
-                await this.forceWait(retryAfter * 1000);
-                throw new Error(`Rate Limit Hit (429)`);
+            const statusCode = response.statusCode;
+
+            // Handle 429 (Rate Limit)
+            if (statusCode === 429) {
+                const retryAfterSec = Number(response.headers["retry-after"]) || 5;
+                await this.forceWait(retryAfterSec * 1000);
+                throw new Error(`Rate Limit Hit (429) - Waited ${retryAfterSec}s`);
             }
 
-            // 3. Adaptive Logic (Aggiornamento latenza e throttling)
-            const duration = Date.now() - start;
-            if (this.enableAdaptiveThrottling && duration > 100) {
-                this.updateThrottleLogic(duration);
+            // Adaptive Logic Hook
+            // FILTER: We only measure Success (2xx/3xx).
+            // We ignore 4xx (often fast failures) and 5xx (server faults, handled by retry).
+            if (this.adaptiveEnabled && measuredDuration > 0 && statusCode < 400) {
+                this.updateThrottleLogic(measuredDuration);
             }
 
-            if (response.statusCode >= 500) {
-                throw new Error(`Server Error: ${response.statusCode}`);
-            }
+            // HTTP Errors
+            if (statusCode >= 500) throw new Error(`Server Error ${statusCode}`);
+            if (statusCode >= 400) throw new AbortError(`Client Error ${statusCode}: ${rawBody.substring(0, 200)}`);
 
-            if (response.statusCode >= 400) {
-                const errBody = await response.body.text();
-                throw new AbortError(`Client Error ${response.statusCode}: ${errBody}`);
-            }
-
-            // 4. Parsing
+            // Parsing
             const contentType = response.headers["content-type"];
             if (contentType && contentType.includes("application/json")) {
-                return (await response.body.json()) as T;
+                try {
+                    return JSON.parse(rawBody) as T;
+                } catch (e) {
+                    throw new AbortError("Invalid JSON response");
+                }
             }
-            return (await response.body.text()) as unknown as T;
+
+            return rawBody as unknown as T;
         }, this.retryOptions);
     }
 
     // ==========================================
-    // ADAPTIVE THROTTLING LOGIC
+    // ADAPTIVE LOGIC CORE (AIMD + Noise Filter)
     // ==========================================
 
     private updateThrottleLogic(duration: number) {
-        // Exponential Moving Average (EMA)
         if (this.avgLatency === 0) {
             this.avgLatency = duration;
-        } else {
-            // Peso del 10% alla nuova richiesta
-            this.avgLatency = 0.1 * duration + 0.9 * this.avgLatency;
+            return;
         }
 
-        // Se la durata attuale è molto sopra la media -> Congestione -> Rallenta
-        if (duration > this.avgLatency * this.congestionThreshold) {
-            this.increaseDelay();
-        } else if (this.currentMinTime > this.baseMinTime) {
-            // Soft landing: se non c'è congestione E siamo ancora rallentati, recupera gradualmente
-            // Non serve controllare duration < avgLatency perché se non c'è congestione, possiamo recuperare
-            this.decreaseDelay();
+        // EMA Update
+        this.avgLatency = 0.2 * duration + 0.8 * this.avgLatency;
+
+        // A. Low Latency Guard
+        if (duration < this.adaptiveIgnoreBelow) {
+            this.congestionHits = 0;
+            if (this.currentMinTime > this.baseMinTime) this.decreaseDelay();
+            return;
+        }
+
+        // B. Congestion Check
+        if (duration > this.avgLatency * this.congestionRatio) {
+            this.congestionHits++;
+            if (this.congestionHits >= this.breachLimit) {
+                this.congestionHits = 0; // RESET
+                this.increaseDelay();
+            }
+        } else {
+            // C. Recovery
+            this.congestionHits = 0;
+            if (this.currentMinTime > this.baseMinTime) {
+                this.decreaseDelay();
+            }
         }
     }
 
     private increaseDelay() {
-        // Moltiplichiamo il ritardo ATTUALE, non quello base, per scalare se la congestione persiste
-        // Cap massimo configurabile per non "uccidere" il pool
-        const nextDelay = Math.max(this.currentMinTime * 2, 200);
-        this.currentMinTime = Math.min(nextDelay, this.maxMinTime);
-
-        this.limiter.updateSettings({ minTime: this.currentMinTime });
+        const nextDelay = Math.min(this.currentMinTime + this.increaseStep, this.maxMinTime);
+        this.applyNewSettings(nextDelay);
     }
 
     private decreaseDelay() {
-        // Riduciamo gradualmente usando il recoveryFactor invece di resettare subito
-        const nextDelay = this.currentMinTime * this.recoveryFactor;
+        const nextDelay = Math.max(this.currentMinTime * this.decreaseFactor, this.baseMinTime);
+        this.applyNewSettings(nextDelay);
+    }
 
-        // Non scendiamo mai sotto il baseMinTime definito dall'utente
-        this.currentMinTime = Math.max(nextDelay, this.baseMinTime);
+    private applyNewSettings(newMinTime: number) {
+        newMinTime = Math.ceil(newMinTime);
 
+        // 1. THRESHOLD Check
+        const diff = Math.abs(newMinTime - this.currentMinTime);
+        const percentThreshold = this.currentMinTime > 0 ? this.currentMinTime * this.tuningPercent : 10;
+
+        if (diff < Math.max(10, percentThreshold)) return;
+
+        // 2. DEBOUNCE & TRAILING Logic
+        const now = performance.now();
+        const timeSinceLastUpdate = now - this.lastSettingsUpdate;
+
+        if (timeSinceLastUpdate >= this.tuningDebounce) {
+            // Immediate update
+            this.performUpdate(newMinTime);
+        } else {
+            // Delayed update (Trailing)
+            this.pendingMinTime = newMinTime;
+
+            if (!this.pendingUpdateTimer) {
+                const waitMs = this.tuningDebounce - timeSinceLastUpdate;
+
+                this.pendingUpdateTimer = setTimeout(() => {
+                    this.pendingUpdateTimer = null;
+
+                    const value = this.pendingMinTime;
+                    this.pendingMinTime = null;
+
+                    if (value !== null) {
+                        this.performUpdate(value);
+                    }
+                }, waitMs);
+            }
+        }
+    }
+
+    private performUpdate(value: number) {
+        if (this.pendingUpdateTimer) {
+            clearTimeout(this.pendingUpdateTimer);
+            this.pendingUpdateTimer = null;
+        }
+        this.pendingMinTime = null;
+
+        this.currentMinTime = value;
+        this.lastSettingsUpdate = performance.now();
         this.limiter.updateSettings({ minTime: this.currentMinTime });
     }
 
     private async forceWait(ms: number) {
-        // Aspetta il tempo indicato da Retry-After header
-        // Bottleneck gestisce rate limiting, p-retry gestisce il retry
         await new Promise(r => setTimeout(r, ms));
     }
 
-    public getCurrentMinTime() {
-        return this.currentMinTime;
-    }
-
-    /** Chiude pool e limiter per liberare le risorse */
     public async close() {
+        if (this.pendingUpdateTimer) {
+            clearTimeout(this.pendingUpdateTimer);
+            this.pendingUpdateTimer = null;
+        }
         await this.limiter.stop();
         await this.client.close();
     }
