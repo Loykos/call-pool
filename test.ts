@@ -134,7 +134,7 @@ async function runTests() {
             const pool = new CallPool({
                 baseUrl: "https://jsonplaceholder.typicode.com",
             });
-            await pool.request("/posts/1", { priority: 9 });
+            await pool.request("/posts/1", { priority: 1 });
             await pool.close();
         })
     );

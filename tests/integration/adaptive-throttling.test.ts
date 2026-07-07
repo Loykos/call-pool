@@ -99,7 +99,7 @@ describe("CallPool - Adaptive Throttling Integration", () => {
                     baseUrl: url,
                     concurrency: { limit: LIMIT },
                     rateLimit: { minTime: 0 },
-                    retry: { maxAttempts: 2, delay: 200 },
+                    retry: { maxAttempts: 3, delay: 200 },
                     adaptive:
                         mode === "ADAPTIVE"
                             ? {

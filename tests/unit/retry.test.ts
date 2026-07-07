@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { CallPool } from "../../src/index";
 import { MockServer } from "../setup/mock-server";
 
@@ -35,8 +35,8 @@ describe.concurrent("Retry Suite", () => {
 
             try {
                 await expect(pool.request("/always-500")).rejects.toThrow("500");
-                // 1 iniziale + 2 retry = 3 tentativi
-                expect(mockServer.getRequestCount()).toBe(3);
+                // maxAttempts includes the initial request.
+                expect(mockServer.getRequestCount()).toBe(2);
             } finally {
                 await Promise.all([pool.close(), mockServer.stop()]);
             }
@@ -80,7 +80,7 @@ describe.concurrent("Retry Suite", () => {
 
             const pool = new CallPool({
                 baseUrl,
-                retry: { maxAttempts: 2, delay: 1000, factor: 2 },
+                retry: { maxAttempts: 3, delay: 1000, factor: 2 },
             });
 
             try {
@@ -102,7 +102,7 @@ describe.concurrent("Retry Suite", () => {
 
             const pool = new CallPool({
                 baseUrl,
-                retry: { maxAttempts: 1, delay: 500 },
+                retry: { maxAttempts: 2, delay: 500 },
             });
 
             try {
@@ -122,7 +122,7 @@ describe.concurrent("Retry Suite", () => {
             // Porta non esistente per forzare errore di rete
             const pool = new CallPool({
                 baseUrl: "http://127.0.0.1:59999",
-                retry: { maxAttempts: 1, delay: 10 },
+                retry: { maxAttempts: 2, delay: 10 },
             });
 
             try {

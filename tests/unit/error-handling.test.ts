@@ -98,7 +98,7 @@ describe.concurrent("Error Handling", () => {
 
             const pool = new CallPool({
                 baseUrl,
-                retry: { maxAttempts: 2, delay: 1000 },
+                retry: { maxAttempts: 3, delay: 1000 },
             });
 
             try {
@@ -106,7 +106,7 @@ describe.concurrent("Error Handling", () => {
                 await expect(pool.request("/500")).rejects.toThrow("500");
                 const duration = Date.now() - start;
 
-                // 1 attempt + 2 retries. Delay: 1s, then 2s (factor 2). Total wait ~3s.
+                // 3 total attempts: initial attempt + 2 retries. Delay: 1s, then 2s.
                 expect(duration).toBeGreaterThanOrEqual(3000);
                 expect(mockServer.getRequestCount()).toBe(3);
             } finally {
@@ -126,7 +126,7 @@ describe.concurrent("Error Handling", () => {
             const pool = new CallPool({
                 baseUrl,
                 network: { timeout: 1000 }, // Timeout at 1s
-                retry: { maxAttempts: 1, delay: 500 },
+                retry: { maxAttempts: 2, delay: 500 },
             });
 
             try {
@@ -142,7 +142,7 @@ describe.concurrent("Error Handling", () => {
             // Closed port
             const pool = new CallPool({
                 baseUrl: "http://127.0.0.1:59999",
-                retry: { maxAttempts: 1, delay: 100 },
+                retry: { maxAttempts: 2, delay: 100 },
             });
 
             try {

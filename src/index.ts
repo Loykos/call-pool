@@ -13,7 +13,7 @@ export interface CallPoolOptions {
 
     /** Concurrency Configuration (Socket/Queue) */
     concurrency?: {
-        limit?: number; // Default: 10
+        limit?: number; // Default: 1
     };
 
     /** Static Configuration (Contractual Rate Limit) */
@@ -73,6 +73,7 @@ export interface CallPoolOptions {
 
     /** Retry Configuration (Resilience) */
     retry?: {
+        /** Total number of attempts, including the initial request. Default: 3 */
         maxAttempts?: number;
         delay?: number;
         factor?: number;
@@ -85,10 +86,11 @@ export interface CallPoolOptions {
     };
 }
 
-export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin" | "path" | "method" | "body"> {
+export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin" | "path" | "method" | "body" | "headers"> {
     method?: Dispatcher.HttpMethod;
     priority?: number;
     body?: string | Buffer | Uint8Array | Record<string, any> | null;
+    headers?: Record<string, string>;
 }
 
 // ==========================================
@@ -131,6 +133,8 @@ export class CallPool {
     private currentConcurrency: number;
 
     constructor(options: CallPoolOptions) {
+        this.validateOptions(options);
+
         const concurrencyLimit = options.concurrency?.limit ?? 1;
         const rateOpts = options.rateLimit;
         const adaptOpts = options.adaptive;
@@ -154,8 +158,9 @@ export class CallPool {
         this.requestTimeout = options.network?.timeout ?? 30_000;
         this.defaultHeaders = options.network?.defaultHeaders ?? {};
 
+        const maxAttempts = options.retry?.maxAttempts ?? 3;
         this.retryOptions = {
-            retries: options.retry?.maxAttempts ?? 3,
+            retries: maxAttempts - 1,
             minTimeout: options.retry?.delay ?? 1000,
             factor: options.retry?.factor ?? 2,
         };
@@ -201,8 +206,89 @@ export class CallPool {
         });
     }
 
+    private validateOptions(options: CallPoolOptions) {
+        if (!options || typeof options.baseUrl !== "string" || options.baseUrl.length === 0) {
+            throw new Error("[CallPool] 'baseUrl' is required");
+        }
+
+        try {
+            new URL(options.baseUrl);
+        } catch {
+            throw new Error("[CallPool] 'baseUrl' must be a valid URL");
+        }
+
+        const concurrencyLimit = options.concurrency?.limit ?? 1;
+        if (!Number.isInteger(concurrencyLimit) || concurrencyLimit < 1) {
+            throw new Error("[CallPool] 'concurrency.limit' must be a positive integer");
+        }
+
+        const quota = options.rateLimit?.quota;
+        if (quota) {
+            if (!Number.isInteger(quota.max) || quota.max < 1) {
+                throw new Error("[CallPool] 'rateLimit.quota.max' must be a positive integer");
+            }
+            if (!Number.isFinite(quota.window) || quota.window <= 0) {
+                throw new Error("[CallPool] 'rateLimit.quota.window' must be a positive number");
+            }
+        }
+
+        const minTime = options.rateLimit?.minTime;
+        if (minTime === "auto" && !quota) {
+            throw new Error("[CallPool] 'auto' requires 'quota'");
+        }
+        if (minTime !== undefined && minTime !== "auto" && (!Number.isFinite(minTime) || minTime < 0)) {
+            throw new Error("[CallPool] 'rateLimit.minTime' must be a non-negative number or 'auto'");
+        }
+
+        const retry = options.retry;
+        if (retry?.maxAttempts !== undefined && (!Number.isInteger(retry.maxAttempts) || retry.maxAttempts < 1)) {
+            throw new Error("[CallPool] 'retry.maxAttempts' must be a positive integer");
+        }
+        if (retry?.delay !== undefined && (!Number.isFinite(retry.delay) || retry.delay < 0)) {
+            throw new Error("[CallPool] 'retry.delay' must be a non-negative number");
+        }
+        if (retry?.factor !== undefined && (!Number.isFinite(retry.factor) || retry.factor < 1)) {
+            throw new Error("[CallPool] 'retry.factor' must be greater than or equal to 1");
+        }
+
+        const timeout = options.network?.timeout;
+        if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) {
+            throw new Error("[CallPool] 'network.timeout' must be a positive number");
+        }
+
+        const adaptive = options.adaptive;
+        if (!adaptive) return;
+
+        if (adaptive.ignoreBelow !== undefined && (!Number.isFinite(adaptive.ignoreBelow) || adaptive.ignoreBelow < 0)) {
+            throw new Error("[CallPool] 'adaptive.ignoreBelow' must be a non-negative number");
+        }
+        if (adaptive.congestionRatio !== undefined && (!Number.isFinite(adaptive.congestionRatio) || adaptive.congestionRatio <= 0)) {
+            throw new Error("[CallPool] 'adaptive.congestionRatio' must be a positive number");
+        }
+        if (adaptive.breachLimit !== undefined && (!Number.isInteger(adaptive.breachLimit) || adaptive.breachLimit < 1)) {
+            throw new Error("[CallPool] 'adaptive.breachLimit' must be a positive integer");
+        }
+        if (adaptive.increaseStep !== undefined && (!Number.isInteger(adaptive.increaseStep) || adaptive.increaseStep < 1)) {
+            throw new Error("[CallPool] 'adaptive.increaseStep' must be a positive integer");
+        }
+        if (adaptive.decreaseFactor !== undefined && (!Number.isFinite(adaptive.decreaseFactor) || adaptive.decreaseFactor <= 0 || adaptive.decreaseFactor >= 1)) {
+            throw new Error("[CallPool] 'adaptive.decreaseFactor' must be greater than 0 and less than 1");
+        }
+        if (adaptive.minConcurrency !== undefined) {
+            if (!Number.isInteger(adaptive.minConcurrency) || adaptive.minConcurrency < 1) {
+                throw new Error("[CallPool] 'adaptive.minConcurrency' must be a positive integer");
+            }
+            if (adaptive.minConcurrency > concurrencyLimit) {
+                throw new Error("[CallPool] 'adaptive.minConcurrency' cannot exceed 'concurrency.limit'");
+            }
+        }
+    }
+
     public async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T> {
         const { priority = 5, ...reqOpts } = options;
+        if (!Number.isInteger(priority) || priority < 0 || priority > 9) {
+            throw new Error("[CallPool] 'priority' must be an integer between 0 and 9");
+        }
         return this.limiter.schedule({ priority }, () => this.executeWithRetry<T>(path, reqOpts));
     }
 
@@ -214,21 +300,24 @@ export class CallPool {
             let measuredDuration = 0;
 
             try {
-                let body = reqOpts.body;
-                const headers = { ...this.defaultHeaders, ...reqOpts.headers } as Record<string, string>;
+                const { body: requestBody, headers: requestHeaders, method = "GET", ...dispatcherOptions } = reqOpts;
+                let body = requestBody;
+                const headers = { ...this.defaultHeaders, ...requestHeaders } as Record<string, string>;
 
                 if (body && typeof body === "object" && !Buffer.isBuffer(body) && !(body instanceof Uint8Array)) {
                     body = JSON.stringify(body);
-                    if (!headers["Content-Type"]) headers["Content-Type"] = "application/json";
+                    if (!this.hasHeader(headers, "content-type")) headers["Content-Type"] = "application/json";
                 }
 
                 // Request
                 response = await this.client.request({
+                    ...dispatcherOptions,
                     path,
-                    method: reqOpts.method || "GET",
+                    method,
                     headers,
                     body: body as string | Buffer | Uint8Array | null,
-                    headersTimeout: this.requestTimeout,
+                    headersTimeout: dispatcherOptions.headersTimeout ?? this.requestTimeout,
+                    bodyTimeout: dispatcherOptions.bodyTimeout ?? this.requestTimeout,
                 });
 
                 // Measure TTFB
@@ -248,9 +337,9 @@ export class CallPool {
 
             // Handle 429 (Rate Limit)
             if (statusCode === 429) {
-                const retryAfterSec = Number(response.headers["retry-after"]) || 5;
-                await this.forceWait(retryAfterSec * 1000);
-                throw new Error(`Rate Limit Hit (429) - Waited ${retryAfterSec}s`);
+                const retryAfterMs = this.parseRetryAfterMs(response.headers["retry-after"]);
+                await this.forceWait(retryAfterMs);
+                throw new Error(`Rate Limit Hit (429) - Waited ${Math.ceil(retryAfterMs / 1000)}s`);
             }
 
             // Adaptive Logic Hook
@@ -263,7 +352,7 @@ export class CallPool {
             if (statusCode >= 400) throw new AbortError(`Client Error ${statusCode}: ${rawBody.substring(0, 200)}`);
 
             // Parsing
-            const contentType = response.headers["content-type"];
+            const contentType = this.getHeaderValue(response.headers["content-type"]);
             if (contentType && contentType.includes("application/json")) {
                 try {
                     return JSON.parse(rawBody) as T;
@@ -274,6 +363,28 @@ export class CallPool {
 
             return rawBody as unknown as T;
         }, this.retryOptions);
+    }
+
+    private hasHeader(headers: Record<string, string>, name: string) {
+        const lowerName = name.toLowerCase();
+        return Object.keys(headers).some(key => key.toLowerCase() === lowerName);
+    }
+
+    private getHeaderValue(value: string | string[] | undefined) {
+        return Array.isArray(value) ? value[0] : value;
+    }
+
+    private parseRetryAfterMs(value: string | string[] | undefined) {
+        const retryAfter = this.getHeaderValue(value);
+        if (!retryAfter) return 5000;
+
+        const seconds = Number(retryAfter);
+        if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+
+        const retryAt = Date.parse(retryAfter);
+        if (Number.isFinite(retryAt)) return Math.max(0, retryAt - Date.now());
+
+        return 5000;
     }
 
     // ==========================================

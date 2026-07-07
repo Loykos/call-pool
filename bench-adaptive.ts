@@ -131,7 +131,7 @@ async function runBenchmark(mode: "STATIC" | "ADAPTIVE"): Promise<BenchResult> {
     const pool = new CallPool({
         baseUrl: server.url,
         concurrency: { limit: LIMIT },
-        retry: { maxAttempts: 2, delay: 200 },
+        retry: { maxAttempts: 3, delay: 200 },
         adaptive:
             mode === "ADAPTIVE"
                 ? {

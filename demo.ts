@@ -57,7 +57,7 @@ async function demo() {
         // Test 5: Priority
         console.log("📥 Test 5: High priority request");
         const urgent = await pool.request<any>("/posts/1", {
-            priority: 9,
+            priority: 1,
         });
         console.log(`✅ Urgent request completed: ${urgent.title}\n`);
 

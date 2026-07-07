@@ -38,7 +38,7 @@ describe.concurrent("Configuration Enforcement", () => {
             const pool = new CallPool({
                 baseUrl,
                 network: { timeout: 800 }, // Timeout configurato a meno della latenza
-                retry: { maxAttempts: 0 }, // Nessun retry per isolare il timeout
+                retry: { maxAttempts: 1 }, // Nessun retry per isolare il timeout
             });
 
             try {
@@ -51,6 +51,14 @@ describe.concurrent("Configuration Enforcement", () => {
             } finally {
                 await Promise.all([pool.close(), mockServer.stop()]);
             }
+        });
+
+        it("should fail early on invalid numeric configuration", () => {
+            expect(() => new CallPool({ baseUrl: "http://localhost", concurrency: { limit: 0 } })).toThrow(/concurrency\.limit/);
+            expect(() => new CallPool({ baseUrl: "http://localhost", rateLimit: { minTime: -1 } })).toThrow(/rateLimit\.minTime/);
+            expect(() => new CallPool({ baseUrl: "http://localhost", retry: { maxAttempts: 0 } })).toThrow(/retry\.maxAttempts/);
+            expect(() => new CallPool({ baseUrl: "http://localhost", network: { timeout: 0 } })).toThrow(/network\.timeout/);
+            expect(() => new CallPool({ baseUrl: "http://localhost", adaptive: { decreaseFactor: 1 } })).toThrow(/adaptive\.decreaseFactor/);
         });
     });
 

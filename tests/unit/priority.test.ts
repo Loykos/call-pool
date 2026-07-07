@@ -76,6 +76,17 @@ describe.concurrent("Priority Queue Enforcement", () => {
         }
     });
 
+    it("should reject priority outside the supported range", async () => {
+        const pool = new CallPool({ baseUrl: "http://localhost" });
+
+        try {
+            await expect(pool.request("/invalid-low", { priority: -1 })).rejects.toThrow(/priority/);
+            await expect(pool.request("/invalid-high", { priority: 10 })).rejects.toThrow(/priority/);
+        } finally {
+            await pool.close();
+        }
+    });
+
     it("should respect priority with latency even without concurrency limit", async () => {
         const mockServer = new MockServer();
         const baseUrl = await mockServer.start({ latency: 2000 });

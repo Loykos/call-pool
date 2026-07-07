@@ -2,12 +2,31 @@
     "name": "call-pool",
     "version": "0.0.0",
     "description": "HTTP request pool con rate limiting, retry e adaptive throttling",
-    "main": "dist/index.js",
-    "types": "dist/index.d.ts",
+    "type": "module",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js",
+            "default": "./dist/index.js"
+        }
+    },
+    "files": [
+        "dist/index.js",
+        "dist/index.js.map",
+        "dist/index.d.ts",
+        "dist/index.d.ts.map",
+        "README.md",
+        "LICENSE"
+    ],
+    "engines": {
+        "node": ">=18.17"
+    },
     "scripts": {
         "build": "tsc",
+        "prepack": "pnpm build",
         "prepublishOnly": "pnpm build",
-        "publish": "pnpm publish",
         "demo": "tsx demo.ts",
         "bench": "tsx bench-adaptive.ts",
         "test": "vitest",
@@ -37,8 +56,5 @@
         "tsx": "^4.7.0",
         "typescript": "^5.0.0",
         "vitest": "^1.6.0"
-    },
-    "peerDependencies": {
-        "typescript": "^5.0.0"
     }
 }

@@ -21,6 +21,8 @@ The tool uses a **Real-Time Adaptive Throttling** feature (based on the **EMA al
 
 ## Installation
 
+Requires Node.js `>=18.17`. CallPool is published as an ESM package.
+
 ```bash
 pnpm install call-pool
 ```
@@ -60,13 +62,15 @@ const pool = new CallPool({
             max: 100, // 100 requests
             window: 60000, // in 60 seconds (1 minute)
         },
-        enableAdaptiveThrottling: true, // Enable adaptive throttling
-        congestionThreshold: 2.5, // Slow down if latency > 2.5x the average
+    },
+    adaptive: {
+        enabled: true, // Enable adaptive throttling
+        congestionRatio: 2.5, // Slow down if latency > 2.5x the average
     },
     retry: {
-        maxAttempts: 5, // More attempts for external services
+        maxAttempts: 5, // Total attempts for external services
         delay: 2000, // 2 seconds initial wait
-        factor: 2, // Exponential backoff: 2s, 4s, 8s, 16s, 32s
+        factor: 2, // Exponential backoff between attempts: 2s, 4s, 8s, 16s
     },
 });
 
@@ -92,13 +96,21 @@ const pool = new CallPool({
             max: 1000, // 1000 requests
             window: 3600000, // in 1 hour
         },
-        enableAdaptiveThrottling: true, // Enable adaptive throttling
-        congestionThreshold: 2.0, // Threshold for adaptive throttling
+    },
+    adaptive: {
+        enabled: true, // Enable adaptive throttling
+        useTTFB: true, // Measure time to first byte instead of full download
+        ignoreBelow: 100, // Treat very fast requests as headroom signals
+        congestionRatio: 2.0, // Threshold for adaptive throttling
+        breachLimit: 2, // Consecutive congestion samples before slowing down
+        increaseStep: 1, // Additive recovery step
+        decreaseFactor: 0.9, // Multiplicative backoff factor
+        minConcurrency: 1, // Adaptive lower bound
     },
     retry: {
-        maxAttempts: 3, // Maximum 3 attempts
+        maxAttempts: 3, // Maximum 3 total attempts
         delay: 1000, // 1 second initial delay
-        factor: 2, // Backoff: 1s, 2s, 4s
+        factor: 2, // Backoff between attempts: 1s, 2s
     },
     network: {
         timeout: 30000, // 30 seconds timeout
@@ -117,12 +129,12 @@ const users = await pool.request<User[]>("/users");
 const newUser = await pool.request<User>("/users", {
     method: "POST",
     body: { name: "John", email: "john@example.com" }, // Automatically serialized to JSON
-    priority: 9, // High priority
+    priority: 1, // High priority
 });
 
 const urgent = await pool.request("/urgent", {
     method: "GET",
-    priority: 9,
+    priority: 1,
     headers: {
         "X-Custom-Header": "value",
     },
@@ -152,14 +164,25 @@ await pool.close();
 | `rateLimit.minTime`                  | `number \| "auto"` | No       | `0`     | Minimum time between requests in ms, or `"auto"` for automatic calculation (requires `quota`)                                                    |
 | `rateLimit.quota.max`                | `number`           | No       | -       | Maximum number of requests allowed in the time window                                                                                            |
 | `rateLimit.quota.window`             | `number`           | No       | -       | Time window in ms (e.g., 60000 for 1 minute)                                                                                                     |
-| `rateLimit.enableAdaptiveThrottling` | `boolean`          | No       | `false` | Enable adaptive throttling based on latency monitoring                                                                                           |
-| `rateLimit.congestionThreshold`      | `number`           | No       | `2.0`   | Threshold for adaptive throttling. If latency > average × threshold, the pool slows down. Only effective if `enableAdaptiveThrottling` is `true` |
+
+### Adaptive Configuration
+
+| Option                    | Type      | Required | Default | Description                                                                                                      |
+| ------------------------- | --------- | -------- | ------- | ---------------------------------------------------------------------------------------------------------------- |
+| `adaptive.enabled`        | `boolean` | No       | `false` | Enable adaptive throttling based on latency monitoring                                                           |
+| `adaptive.useTTFB`        | `boolean` | No       | `true`  | Measure Time To First Byte instead of full body download                                                          |
+| `adaptive.ignoreBelow`    | `number`  | No       | `100`   | Requests faster than this threshold are treated as headroom signals and excluded from the baseline                |
+| `adaptive.congestionRatio` | `number`  | No       | `2.0`   | If latency > average × ratio, the request counts as congestion                                                    |
+| `adaptive.breachLimit`    | `number`  | No       | `2`     | Consecutive congestion samples required before reducing concurrency                                               |
+| `adaptive.increaseStep`   | `number`  | No       | `1`     | Number of concurrency slots added during recovery                                                                 |
+| `adaptive.decreaseFactor` | `number`  | No       | `0.9`   | Multiplicative decrease factor applied during congestion. Must be greater than 0 and less than 1                  |
+| `adaptive.minConcurrency` | `number`  | No       | `1`     | Lower bound for adaptive concurrency. Cannot exceed `concurrency.limit`                                           |
 
 ### Retry Configuration
 
 | Option              | Type     | Required | Default | Description                                         |
 | ------------------- | -------- | -------- | ------- | --------------------------------------------------- |
-| `retry.maxAttempts` | `number` | No       | `3`     | Maximum number of retry attempts                    |
+| `retry.maxAttempts` | `number` | No       | `3`     | Maximum total attempts, including the initial request |
 | `retry.delay`       | `number` | No       | `1000`  | Base delay in ms before the first retry             |
 | `retry.factor`      | `number` | No       | `2`     | Exponential backoff factor (delay × factor^attempt) |
 
@@ -167,7 +190,7 @@ await pool.close();
 
 | Option                   | Type                     | Required | Default | Description                         |
 | ------------------------ | ------------------------ | -------- | ------- | ----------------------------------- |
-| `network.timeout`        | `number`                 | No       | `30000` | Timeout for single request in ms    |
+| `network.timeout`        | `number`                 | No       | `30000` | Header and body inactivity timeout for a single request in ms |
 | `network.defaultHeaders` | `Record<string, string>` | No       | `{}`    | Headers to include in every request |
 
 ## Request
@@ -185,7 +208,7 @@ const pool = new CallPool({
 
 // GET request with high priority
 const data = await pool.request("/data", {
-    priority: 9,
+    priority: 1,
 });
 
 // POST request with custom headers
@@ -251,19 +274,19 @@ const newUser = await pool.request<User>("/users", {
 | Option     | Type                                               | Required | Default | Description                                                    |
 | ---------- | -------------------------------------------------- | -------- | ------- | -------------------------------------------------------------- |
 | `method`   | `HttpMethod`                                       | No       | `"GET"` | HTTP method (GET, POST, PUT, DELETE, etc.)                     |
-| `priority` | `number`                                           | No       | `5`     | Queue priority (0-9, 9 is highest)                             |
+| `priority` | `number`                                           | No       | `5`     | Queue priority (0-9, lower numbers run first; 0 is highest)    |
 | `body`     | `string \| Buffer \| Uint8Array \| object \| null` | No       | -       | Request body (JS objects are automatically serialized to JSON) |
 | `headers`  | `Record<string, string>`                           | No       | -       | Additional headers for the single request                      |
 
 ## Adaptive Throttling
 
-Adaptive throttling is **disabled by default**. To enable it, set `rateLimit.enableAdaptiveThrottling` to `true`.
+Adaptive throttling is **disabled by default**. To enable it, set `adaptive.enabled` to `true`.
 
 When enabled, the pool automatically monitors request latency and slows down when congestion is detected:
 
 -   Calculates an exponential moving average (EMA) of latency
--   If a request is slower than the average multiplied by `congestionThreshold`, it increases the delay
--   When requests become fast again, it restores the original delay
+-   If a request is slower than the average multiplied by `adaptive.congestionRatio`, it reduces concurrency
+-   When requests become fast again, it restores concurrency gradually
 
 ## Error Handling
 
