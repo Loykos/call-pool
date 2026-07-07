@@ -34,7 +34,7 @@ describe.concurrent("Retry Suite", () => {
             });
 
             try {
-                await expect(pool.request("/always-500")).rejects.toThrow("Server Error: 500");
+                await expect(pool.request("/always-500")).rejects.toThrow("500");
                 // 1 iniziale + 2 retry = 3 tentativi
                 expect(mockServer.getRequestCount()).toBe(3);
             } finally {

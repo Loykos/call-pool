@@ -17,7 +17,7 @@ describe.concurrent("Error Handling", () => {
 
             const pool = new CallPool({
                 baseUrl,
-                retry: { delay: 500 }, // p-retry aggiungerà questo al forceWait
+                retry: { delay: 500 }, // p-retry will add this to forceWait
             });
 
             try {
@@ -25,7 +25,7 @@ describe.concurrent("Error Handling", () => {
                 await pool.request("/test-429");
                 const duration = Date.now() - start;
 
-                // Spiegazione: 2s (Retry-After) + ~0.5s (p-retry delay)
+                // Explanation: 2s (Retry-After) + ~0.5s (p-retry delay)
                 expect(duration).toBeGreaterThanOrEqual(2000);
                 expect(mockServer.getRequestCount()).toBe(2);
             } finally {
@@ -47,7 +47,7 @@ describe.concurrent("Error Handling", () => {
                 await pool.request("/test-429-no-header");
                 const duration = Date.now() - start;
 
-                // La classe ha un default di 5s per i 429 senza header
+                // The class has a default of 5s for 429 without header
                 expect(duration).toBeGreaterThanOrEqual(5000);
                 expect(mockServer.getRequestCount()).toBe(2);
             } finally {
@@ -67,7 +67,7 @@ describe.concurrent("Error Handling", () => {
 
             try {
                 await expect(pool.request("/400")).rejects.toThrow(/Client Error 400: Invalid Payload/);
-                // Deve aver provato esattamente una volta
+                // Must have tried exactly once
                 expect(mockServer.getRequestCount()).toBe(1);
             } finally {
                 await Promise.all([pool.close(), mockServer.stop()]);
@@ -103,10 +103,10 @@ describe.concurrent("Error Handling", () => {
 
             try {
                 const start = Date.now();
-                await expect(pool.request("/500")).rejects.toThrow("Server Error: 500");
+                await expect(pool.request("/500")).rejects.toThrow("500");
                 const duration = Date.now() - start;
 
-                // 1 tentativo + 2 retry. Delay: 1s, poi 2s (factor 2). Totale attesa ~3s.
+                // 1 attempt + 2 retries. Delay: 1s, then 2s (factor 2). Total wait ~3s.
                 expect(duration).toBeGreaterThanOrEqual(3000);
                 expect(mockServer.getRequestCount()).toBe(3);
             } finally {
@@ -120,12 +120,12 @@ describe.concurrent("Error Handling", () => {
             const mockServer = new MockServer();
             let attempt = 0;
             const baseUrl = await mockServer.start({
-                latency: () => (++attempt === 1 ? 3000 : 0), // Primo tentativo lentissimo
+                latency: () => (++attempt === 1 ? 3000 : 0), // First attempt very slow
             });
 
             const pool = new CallPool({
                 baseUrl,
-                network: { timeout: 1000 }, // Timeout a 1s
+                network: { timeout: 1000 }, // Timeout at 1s
                 retry: { maxAttempts: 1, delay: 500 },
             });
 
@@ -139,7 +139,7 @@ describe.concurrent("Error Handling", () => {
         }, 10000);
 
         it("should retry on connection refused", async () => {
-            // Porta chiusa
+            // Closed port
             const pool = new CallPool({
                 baseUrl: "http://127.0.0.1:59999",
                 retry: { maxAttempts: 1, delay: 100 },

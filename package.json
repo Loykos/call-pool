@@ -9,6 +9,7 @@
         "prepublishOnly": "pnpm build",
         "publish": "pnpm publish",
         "demo": "tsx demo.ts",
+        "bench": "tsx bench-adaptive.ts",
         "test": "vitest",
         "test:watch": "vitest --watch",
         "test:coverage": "vitest --coverage",

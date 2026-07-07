@@ -6,7 +6,12 @@ export interface MockServerOptions {
     statusCode?: number | (() => number);
     headers?: Record<string, string> | (() => Record<string, string>);
     body?: string | object;
-    onRequest?: (req: any) => void;
+
+    /** chiamato quando la richiesta è stata ricevuta e parsed (subito prima di simulare latenza) */
+    onRequestStart?: (req: any) => void;
+
+    /** chiamato appena prima di res.end() (fine reale della risposta) */
+    onRequestEnd?: (req: any) => void;
 }
 
 export class MockServer {
@@ -21,9 +26,7 @@ export class MockServer {
                 this.requestCount++;
                 const bodyChunks: Buffer[] = [];
 
-                req.on("data", chunk => {
-                    bodyChunks.push(chunk);
-                });
+                req.on("data", chunk => bodyChunks.push(chunk));
 
                 req.on("end", async () => {
                     const body = bodyChunks.length > 0 ? Buffer.concat(bodyChunks).toString() : undefined;
@@ -35,33 +38,35 @@ export class MockServer {
                         body,
                     });
 
-                    if (options.onRequest) {
-                        options.onRequest(req);
-                    }
+                    // Hook: start reale
+                    options.onRequestStart?.(req);
 
                     // Simula latenza
                     if (options.latency) {
                         const latency = typeof options.latency === "function" ? options.latency() : options.latency;
-                        await new Promise(r => setTimeout(r, latency));
+                        if (latency > 0) await new Promise(r => setTimeout(r, latency));
                     }
 
-                    // Headers di risposta
+                    // Headers risposta
                     const headers = typeof options.headers === "function" ? options.headers() : options.headers || { "Content-Type": "application/json" };
-                    Object.entries(headers).forEach(([key, value]) => {
-                        res.setHeader(key, value);
-                    });
+
+                    Object.entries(headers).forEach(([key, value]) => res.setHeader(key, value));
 
                     // Status code
                     const statusCode = typeof options.statusCode === "function" ? options.statusCode() : options.statusCode || 200;
                     res.statusCode = statusCode;
 
-                    // Body di risposta
+                    // Body risposta
                     const responseBody =
                         options.body !== undefined
                             ? typeof options.body === "string"
                                 ? options.body
                                 : JSON.stringify(options.body)
                             : JSON.stringify({ success: true });
+
+                    // Hook: end reale (prima di end)
+                    options.onRequestEnd?.(req);
+
                     res.end(responseBody);
                 });
             });
@@ -78,15 +83,10 @@ export class MockServer {
 
     async stop(): Promise<void> {
         return new Promise((resolve, reject) => {
-            if (!this.server) {
-                resolve();
-                return;
-            }
-
+            if (!this.server) return resolve();
             this.server.close(err => {
-                if (err) {
-                    reject(err);
-                } else {
+                if (err) reject(err);
+                else {
                     this.server = null;
                     resolve();
                 }

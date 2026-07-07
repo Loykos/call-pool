@@ -7,8 +7,8 @@ const wait = (ms: number) => new Promise(res => setTimeout(res, ms));
 describe.concurrent("Priority Queue Enforcement", () => {
     it("should reorder requests in the queue (Lower number = Higher Priority)", async () => {
         const mockServer = new MockServer();
-        // Latenza alta: il server "trattiene" la richiesta per 2 secondi
-        // Durante questo tempo, il CallPool non può inviare altro (concurrency: 1)
+        // High latency: the server "holds" the request for 2 seconds
+        // During this time, CallPool cannot send anything else (concurrency: 1)
         const baseUrl = await mockServer.start({ latency: 2000 });
 
         const pool = new CallPool({
@@ -17,30 +17,30 @@ describe.concurrent("Priority Queue Enforcement", () => {
         });
 
         try {
-            // 1. Questa richiesta parte subito e "occupa" il pool per 2 secondi
+            // 1. This request starts immediately and "occupies" the pool for 2 seconds
             const blocker = pool.request("/blocker", { priority: 5 });
 
-            // Aspettiamo un attimo per essere certi che il blocker sia arrivato al server
+            // Wait a moment to ensure the blocker has reached the server
             await wait(200);
 
-            // 2. Inviamo tre richieste mentre il blocker è ancora attivo.
-            // Queste DEVONO finire in coda e Bottleneck le deve riordinare.
-            // Inseriamo volutamente prima quella a priorità bassa (9) e poi quella alta (1)
+            // 2. Send three requests while the blocker is still active.
+            // These MUST end up in queue and Bottleneck must reorder them.
+            // We intentionally insert the low priority one (9) first and then the high one (1)
             const p9 = pool.request("/priority-low-9", { priority: 9 });
             const p1 = pool.request("/priority-high-1", { priority: 1 });
             const p5 = pool.request("/priority-mid-5", { priority: 5 });
 
-            // Aspettiamo che tutto finisca
+            // Wait for everything to finish
             await Promise.all([blocker, p9, p1, p5]);
 
-            // 3. Verifichiamo l'ordine di ARRIVO sul server
+            // 3. Verify the ARRIVAL order on the server
             const requests = mockServer.getRequests();
 
-            // Il blocker è sempre il primo (indice 0)
+            // The blocker is always first (index 0)
             expect(requests[0].path).toBe("/blocker");
 
-            // Il secondo arrivo deve essere la priorità 1, anche se chiamata dopo la 9!
-            // Se questo test passa, significa che Bottleneck ha riordinato la coda.
+            // The second arrival must be priority 1, even if called after 9!
+            // If this test passes, it means Bottleneck has reordered the queue.
             expect(requests[1].path).toBe("/priority-high-1");
             expect(requests[2].path).toBe("/priority-mid-5");
             expect(requests[3].path).toBe("/priority-low-9");
@@ -61,14 +61,14 @@ describe.concurrent("Priority Queue Enforcement", () => {
             const blocker = pool.request("/blocker");
             await wait(200);
 
-            // In coda: una con priorità 6 e una senza (default 5)
+            // In queue: one with priority 6 and one without (default 5)
             const p6 = pool.request("/p6", { priority: 6 });
             const pDefault = pool.request("/default");
 
             await Promise.all([blocker, p6, pDefault]);
 
             const reqs = mockServer.getRequests();
-            // Default (5) vince su 6
+            // Default (5) wins over 6
             expect(reqs[1].path).toBe("/default");
             expect(reqs[2].path).toBe("/p6");
         } finally {
@@ -82,7 +82,7 @@ describe.concurrent("Priority Queue Enforcement", () => {
         const pool = new CallPool({ baseUrl });
 
         try {
-            const r1 = pool.request("/first", { priority: 5 }); // Parte subito
+            const r1 = pool.request("/first", { priority: 5 }); // Starts immediately
             await wait(100);
 
             const rLow = pool.request("/low", { priority: 8 });
@@ -92,7 +92,7 @@ describe.concurrent("Priority Queue Enforcement", () => {
 
             const requests = mockServer.getRequests();
             expect(requests[0].path).toBe("/first");
-            // Allo scoccare dei 2000ms, Bottleneck sceglie la più alta in coda
+            // At 2000ms, Bottleneck chooses the highest in queue
             expect(requests[1].path).toBe("/high");
             expect(requests[2].path).toBe("/low");
         } finally {

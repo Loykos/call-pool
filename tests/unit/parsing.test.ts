@@ -119,7 +119,7 @@ describe.concurrent("Parsing Logic", () => {
             const pool = new CallPool({ baseUrl });
 
             try {
-                // response.body.json() fallirà internamente
+                // response.body.json() will fail internally
                 await expect(pool.request("/invalid-json")).rejects.toThrow();
             } finally {
                 await Promise.all([pool.close(), mockServer.stop()]);
@@ -158,7 +158,7 @@ describe.concurrent("Parsing Logic", () => {
             const pool = new CallPool({ baseUrl });
 
             try {
-                // Test puramente a tempo di compilazione/esecuzione per i generics
+                // Purely compile-time/runtime test for generics
                 const result = await pool.request<User>("/user");
                 expect(result.id).toBe(10);
                 expect(result.username).toBe("dev_user");

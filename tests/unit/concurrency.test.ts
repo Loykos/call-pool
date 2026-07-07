@@ -5,11 +5,11 @@ import { MockServer } from "../setup/mock-server";
 describe.concurrent("Concurrency - Parallelism Proof", () => {
     it("should prove that requests run in parallel (Total time << Sequential time)", async () => {
         const mockServer = new MockServer();
-        // Latenza alta per rendere il test inequivocabile: 2 secondi per richiesta
+        // High latency to make the test unambiguous: 2 seconds per request
         const latency = 2000;
         const baseUrl = await mockServer.start({ latency });
 
-        // Concurrency alta (5)
+        // High concurrency (5)
         const pool = new CallPool({
             baseUrl,
             concurrency: { limit: 5 },
@@ -18,15 +18,15 @@ describe.concurrent("Concurrency - Parallelism Proof", () => {
         try {
             const start = Date.now();
 
-            // Lanciamo 5 richieste.
-            // Se fossero sequenziali ci metterebbero: 5 * 2s = 10 secondi.
-            // Essendo parallele, devono finire tutte intorno ai 2 secondi (+ overhead).
+            // Launch 5 requests.
+            // If sequential they would take: 5 * 2s = 10 seconds.
+            // Being parallel, they must all finish around 2 seconds (+ overhead).
             await Promise.all([pool.request("/p1"), pool.request("/p2"), pool.request("/p3"), pool.request("/p4"), pool.request("/p5")]);
 
             const duration = Date.now() - start;
 
-            // Il test "al contrario": verifichiamo che il tempo sia MOLTO minore di 10s
-            // Se ci mette meno di 3s, il parallelismo è confermato.
+            // Reverse test: verify that time is MUCH less than 10s
+            // If it takes less than 3s, parallelism is confirmed.
             expect(duration).toBeLessThan(3500);
             expect(mockServer.getRequestCount()).toBe(5);
         } finally {
@@ -39,9 +39,9 @@ describe.concurrent("Concurrency - Parallelism Proof", () => {
         const latency = 1500;
         const baseUrl = await mockServer.start({ latency });
 
-        // Scenario: 4 richieste.
-        // Con concurrency 2 -> ci mette ~3 secondi (2 batch da 1.5s)
-        // Con concurrency 4 -> ci mette ~1.5 secondi (1 batch da 1.5s)
+        // Scenario: 4 requests.
+        // With concurrency 2 -> takes ~3 seconds (2 batches of 1.5s)
+        // With concurrency 4 -> takes ~1.5 seconds (1 batch of 1.5s)
         const pool = new CallPool({
             baseUrl,
             concurrency: { limit: 4 },
@@ -52,8 +52,8 @@ describe.concurrent("Concurrency - Parallelism Proof", () => {
             await Promise.all([pool.request("/t1"), pool.request("/t2"), pool.request("/t3"), pool.request("/t4")]);
             const duration = Date.now() - start;
 
-            // Se il limite 4 è rispettato, deve aver impiegato un solo ciclo di latenza
-            // Invece dei 6 secondi (sequenziali) o 3 secondi (concurrency 2)
+            // If limit 4 is respected, it must have taken a single latency cycle
+            // Instead of 6 seconds (sequential) or 3 seconds (concurrency 2)
             expect(duration).toBeLessThan(2500);
         } finally {
             await Promise.all([pool.close(), mockServer.stop()]);
@@ -65,20 +65,20 @@ describe.concurrent("Concurrency - Parallelism Proof", () => {
         const latency = 500; // 0.5s
         const baseUrl = await mockServer.start({ latency });
 
-        // Default concurrency è 1.
+        // Default concurrency is 1.
         const pool = new CallPool({ baseUrl, concurrency: { limit: 10 } });
 
         try {
             const start = Date.now();
             const total = 10;
-            // 10 richieste parallele con concurrency 10
+            // 10 parallel requests with concurrency 10
             await Promise.all(Array.from({ length: total }, (_, i) => pool.request(`/r${i}`)));
 
             const duration = Date.now() - start;
 
-            // Sequenziale sarebbe: 10 * 0.5s = 5 secondi.
-            // Parallelo deve essere: ~0.5 secondi.
-            // Verifichiamo che sia almeno 2 volte più veloce del sequenziale.
+            // Sequential would be: 10 * 0.5s = 5 seconds.
+            // Parallel must be: ~0.5 seconds.
+            // Verify that it's at least 2 times faster than sequential.
             expect(duration).toBeLessThan(2500);
         } finally {
             await Promise.all([pool.close(), mockServer.stop()]);

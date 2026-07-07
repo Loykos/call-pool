@@ -15,7 +15,7 @@ export default defineConfig({
         hookTimeout: 30000,
     },
     esbuild: {
-        sourcemap: "inline", // 'inline' è spesso più stabile per il debug locale
+        sourcemap: "inline", // 'inline' is often more stable for local debugging
         target: "es2020",
     },
 });

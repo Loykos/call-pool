@@ -30,9 +30,9 @@ async function runTests() {
     console.log("🧪 CallPool Test Suite\n");
     const results: TestResult[] = [];
 
-    // Test 1: Configurazione base
+    // Test 1: Base configuration
     results.push(
-        await runTest("Configurazione base", async () => {
+        await runTest("Base configuration", async () => {
             const pool = new CallPool({
                 baseUrl: "https://jsonplaceholder.typicode.com",
             });
@@ -48,7 +48,7 @@ async function runTests() {
             });
             const data = await pool.request("/posts/1");
             if (!data || typeof data !== "object") {
-                throw new Error("Risposta non valida");
+                throw new Error("Invalid response");
             }
             await pool.close();
         })
@@ -69,7 +69,7 @@ async function runTests() {
                 },
             });
             if (!data || typeof data !== "object") {
-                throw new Error("Risposta non valida");
+                throw new Error("Invalid response");
             }
             await pool.close();
         })
@@ -89,7 +89,7 @@ async function runTests() {
             await pool.request("/posts/2");
             const duration = Date.now() - start;
             if (duration < 200) {
-                throw new Error(`Rate limiting non funziona: ${duration}ms < 200ms`);
+                throw new Error(`Rate limiting not working: ${duration}ms < 200ms`);
             }
             await pool.close();
         })
@@ -110,9 +110,9 @@ async function runTests() {
         })
     );
 
-    // Test 6: Quota con auto minTime
+    // Test 6: Quota with auto minTime
     results.push(
-        await runTest("Quota con auto minTime", async () => {
+        await runTest("Quota with auto minTime", async () => {
             const pool = new CallPool({
                 baseUrl: "https://jsonplaceholder.typicode.com",
                 rateLimit: {
@@ -128,9 +128,9 @@ async function runTests() {
         })
     );
 
-    // Test 7: Priorità
+    // Test 7: Priority
     results.push(
-        await runTest("Priorità richieste", async () => {
+        await runTest("Request priority", async () => {
             const pool = new CallPool({
                 baseUrl: "https://jsonplaceholder.typicode.com",
             });
@@ -139,9 +139,9 @@ async function runTests() {
         })
     );
 
-    // Test 8: Headers personalizzati
+    // Test 8: Custom headers
     results.push(
-        await runTest("Headers personalizzati", async () => {
+        await runTest("Custom headers", async () => {
             const pool = new CallPool({
                 baseUrl: "https://jsonplaceholder.typicode.com",
                 network: {
@@ -155,7 +155,7 @@ async function runTests() {
         })
     );
 
-    // Test 9: Retry su errore di rete (simulato con timeout breve)
+    // Test 9: Retry on network error (simulated with short timeout)
     results.push(
         await runTest("Retry configuration", async () => {
             const pool = new CallPool({
@@ -177,18 +177,18 @@ async function runTests() {
                 baseUrl: "https://jsonplaceholder.typicode.com",
             });
             await pool.close();
-            // Verifica che non si possa più usare
+            // Verify that it can no longer be used
             try {
                 await pool.request("/posts/1");
-                throw new Error("Pool dovrebbe essere chiuso");
+                throw new Error("Pool should be closed");
             } catch (error) {
-                // Aspettato
+                // Expected
             }
         })
     );
 
-    // Risultati
-    console.log("\n📊 Risultati:\n");
+    // Results
+    console.log("\n📊 Results:\n");
     let passed = 0;
     let failed = 0;
 
@@ -197,7 +197,7 @@ async function runTests() {
         const status = result.passed ? "PASS" : "FAIL";
         console.log(`${icon} ${result.name} [${status}] (${result.duration}ms)`);
         if (!result.passed && result.error) {
-            console.log(`   Errore: ${result.error}`);
+            console.log(`   Error: ${result.error}`);
         }
         if (result.passed) {
             passed++;
@@ -206,7 +206,7 @@ async function runTests() {
         }
     });
 
-    console.log(`\n📈 Totale: ${passed} passati, ${failed} falliti su ${results.length} test\n`);
+    console.log(`\n📈 Total: ${passed} passed, ${failed} failed out of ${results.length} tests\n`);
 
     if (failed > 0) {
         process.exit(1);
@@ -214,6 +214,6 @@ async function runTests() {
 }
 
 runTests().catch(error => {
-    console.error("❌ Errore fatale:", error);
+    console.error("❌ Fatal error:", error);
     process.exit(1);
 });

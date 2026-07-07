@@ -28,9 +28,7 @@ export interface CallPoolOptions {
      * Manages CONCURRENCY based on actual server latency.
      */
     adaptive?: {
-        /** * Enables dynamic throttling.
-         * Default: false
-         */
+        /** Enables dynamic throttling. Default: false */
         enabled?: boolean;
 
         /**
@@ -41,14 +39,17 @@ export interface CallPoolOptions {
         useTTFB?: boolean;
 
         /**
-         * Minimum duration threshold (ms). If request lasts less than X, it's ignored.
+         * Duration threshold (ms). Requests faster than this are read as a
+         * "server has headroom" signal and trigger a concurrency increase.
+         * They are excluded from the baseline so cache hits can't corrupt it.
          * Default: 100ms
          */
         ignoreBelow?: number;
 
         /**
-         * Average multiplier to define congestion.
-         * E.g. 2.0 = If latency > 2x average, we consider it congestion.
+         * Congestion threshold multiplier. If latency > baseline * congestionRatio,
+         * the request counts as congestion and (after `breachLimit` confirmations)
+         * concurrency is reduced.
          * Default: 2.0
          */
         congestionRatio?: number;
@@ -118,11 +119,11 @@ export class CallPool {
 
     // Tuning Config
     private tuningDebounce: number;
+    private readonly emaAlpha = 0.2;
 
     // Adaptive State
     private lastSettingsUpdate: number = -Infinity;
     private pendingUpdateTimer: NodeJS.Timeout | null = null;
-    private pendingConcurrency: number | null = null;
     private avgLatency: number = 0;
     private congestionHits: number = 0;
 
@@ -130,7 +131,7 @@ export class CallPool {
     private currentConcurrency: number;
 
     constructor(options: CallPoolOptions) {
-        const concurrencyLimit = options.concurrency?.limit ?? 10;
+        const concurrencyLimit = options.concurrency?.limit ?? 1;
         const rateOpts = options.rateLimit;
         const adaptOpts = options.adaptive;
 
@@ -145,8 +146,7 @@ export class CallPool {
 
         // Adaptive Bounds Setup (Sanitized)
         this.minConcurrency = Math.max(1, Math.floor(adaptOpts?.minConcurrency ?? 1));
-        this.maxConcurrency = Math.min(concurrencyLimit, concurrencyLimit);
-        if (this.maxConcurrency < this.minConcurrency) this.maxConcurrency = this.minConcurrency;
+        this.maxConcurrency = Math.max(concurrencyLimit, this.minConcurrency);
 
         this.tuningDebounce = 250;
 
@@ -277,108 +277,98 @@ export class CallPool {
     }
 
     // ==========================================
-    // ADAPTIVE LOGIC CORE (AIMD + Noise Filter)
+    // ADAPTIVE LOGIC CORE (Single-threshold + stable baseline)
     // ==========================================
 
     private updateThrottleLogic(duration: number) {
+        // First sample establishes the baseline
         if (this.avgLatency === 0) {
             this.avgLatency = duration;
             return;
         }
 
-        // EMA Update
-        this.avgLatency = 0.2 * duration + 0.8 * this.avgLatency;
-
-        // A. Low Latency Guard
+        // Trivially fast request: the server has headroom -> recover.
+        // Excluded from the baseline so cache hits can't corrupt it.
         if (duration < this.adaptiveIgnoreBelow) {
             this.congestionHits = 0;
-            if (this.currentConcurrency < this.maxConcurrency) this.increaseConcurrency();
+            this.increaseConcurrency();
             return;
         }
 
-        // B. Congestion Check
-        if (duration > this.avgLatency * this.congestionRatio) {
+        const congestionThreshold = this.avgLatency * this.congestionRatio;
+
+        // Congestion: require breachLimit consecutive samples before reducing.
+        // Congested samples are NOT folded into the baseline (prevents drift).
+        if (duration > congestionThreshold) {
             this.congestionHits++;
             if (this.congestionHits >= this.breachLimit) {
-                this.congestionHits = 0; // RESET
+                this.congestionHits = 0;
                 this.reduceConcurrency();
             }
-        } else {
-            // C. Recovery
-            this.congestionHits = 0;
-            if (this.currentConcurrency < this.maxConcurrency) {
-                this.increaseConcurrency();
-            }
+            return;
         }
-    }
 
-    private reduceConcurrency() {
-        // AIMD Decrease: Multiplicative factor OR at least -1 connection
-        const nextRaw = Math.min(this.currentConcurrency * this.decreaseFactor, this.currentConcurrency - 1);
-
-        // Clamp to safety floor
-        const nextConcurrency = Math.max(nextRaw, this.minConcurrency);
-
-        this.applyNewSettings(nextConcurrency);
+        // Neutral zone: healthy sample -> learn the baseline and recover.
+        this.congestionHits = 0;
+        this.avgLatency = this.emaAlpha * duration + (1 - this.emaAlpha) * this.avgLatency;
+        this.increaseConcurrency();
     }
 
     private increaseConcurrency() {
-        const nextConcurrency = Math.min(this.currentConcurrency + this.increaseStep, this.maxConcurrency);
-        this.applyNewSettings(nextConcurrency);
+        const next = Math.min(this.currentConcurrency + this.increaseStep, this.maxConcurrency);
+        this.applyNewSettings(next);
+    }
+
+    private reduceConcurrency() {
+        // AIMD decrease: multiplicative factor, but always at least -1 connection.
+        const raw = Math.min(this.currentConcurrency * this.decreaseFactor, this.currentConcurrency - 1);
+        const next = Math.max(raw, this.minConcurrency);
+        this.applyNewSettings(next);
     }
 
     private applyNewSettings(newConcurrency: number) {
         newConcurrency = Math.floor(newConcurrency);
         if (newConcurrency === this.currentConcurrency) return;
 
-        // 1. THRESHOLD Check
-        const diff = Math.abs(newConcurrency - this.currentConcurrency);
-        const percentThreshold = this.currentConcurrency > 0 ? this.currentConcurrency : 1;
+        // Logical state updates immediately so the next decision builds on it.
+        this.currentConcurrency = newConcurrency;
 
-        if (diff < Math.max(1, percentThreshold)) return;
-
-        // 2. DEBOUNCE & TRAILING Logic
-        const now = performance.now();
-        const timeSinceLastUpdate = now - this.lastSettingsUpdate;
-
-        if (timeSinceLastUpdate >= this.tuningDebounce) {
-            // Immediate update
-            this.performUpdate(newConcurrency);
-        } else {
-            // Delayed update (Trailing)
-            this.pendingConcurrency = newConcurrency;
-
-            if (!this.pendingUpdateTimer) {
-                const waitMs = this.tuningDebounce - timeSinceLastUpdate;
-
-                this.pendingUpdateTimer = setTimeout(() => {
-                    this.pendingUpdateTimer = null;
-
-                    const value = this.pendingConcurrency;
-                    this.pendingConcurrency = null;
-
-                    if (value !== null) {
-                        this.performUpdate(value);
-                    }
-                }, waitMs);
-            }
-        }
+        // The actual limiter update is debounced (trailing) to avoid thrashing.
+        this.scheduleLimiterUpdate();
     }
 
-    private performUpdate(value: number) {
+    private scheduleLimiterUpdate() {
+        const elapsed = performance.now() - this.lastSettingsUpdate;
+
+        if (elapsed >= this.tuningDebounce) {
+            this.flushLimiterUpdate();
+            return;
+        }
+
+        if (this.pendingUpdateTimer) return;
+
+        this.pendingUpdateTimer = setTimeout(() => {
+            this.pendingUpdateTimer = null;
+            this.flushLimiterUpdate();
+        }, this.tuningDebounce - elapsed);
+    }
+
+    private flushLimiterUpdate() {
         if (this.pendingUpdateTimer) {
             clearTimeout(this.pendingUpdateTimer);
             this.pendingUpdateTimer = null;
         }
-        this.pendingConcurrency = null;
 
-        this.currentConcurrency = value;
         this.lastSettingsUpdate = performance.now();
         this.limiter.updateSettings({ maxConcurrent: this.currentConcurrency });
     }
 
     private async forceWait(ms: number) {
         await new Promise(r => setTimeout(r, ms));
+    }
+
+    public getCurrentConcurrency() {
+        return this.currentConcurrency;
     }
 
     public async close() {

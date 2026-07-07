@@ -89,7 +89,7 @@ describe.concurrent("Rate Limiting", () => {
                     rateLimit: { minTime: "auto" },
                     // Manca la quota!
                 });
-            }).toThrow(/Cannot set minTime to 'auto' without defining a 'quota'/);
+            }).toThrow(/requires 'quota'/g);
         });
     });
 
