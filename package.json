@@ -45,9 +45,20 @@
     ],
     "author": "",
     "license": "MIT",
+    "sideEffects": false,
+    "publishConfig": {
+        "access": "public"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Loykos/call-pool.git"
+    },
+    "bugs": {
+        "url": "https://github.com/Loykos/call-pool/issues"
+    },
+    "homepage": "https://github.com/Loykos/call-pool#readme",
     "dependencies": {
         "bottleneck": "^2.19.5",
-        "p-retry": "^6.2.0",
         "undici": "^6.19.8"
     },
     "devDependencies": {

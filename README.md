@@ -17,7 +17,7 @@ The tool uses a **Real-Time Adaptive Throttling** feature (based on the **EMA al
 -   **HTTP Connection Pool**: Uses [`undici`](https://github.com/nodejs/undici) to efficiently manage TCP connections
 -   **Rate Limiting**: Leverages [`bottleneck`](https://github.com/SGrondin/bottleneck) for precise quota management, supporting both fixed windows and "auto" distribution
 -   **Adaptive Throttling**: Real-time latency monitoring. It automatically slows down when the upstream service starts to lag, preventing 429s and timeouts
--   **Automatic Retry**: Integrated with [`p-retry`](https://github.com/sindresorhus/p-retry) for exponential backoff, network and server errors, including `Retry-After` header support
+-   **Automatic Retry**: Built-in exponential backoff for network and server errors, with `Retry-After` header and `AbortSignal` support
 
 ## Installation
 
@@ -177,6 +177,7 @@ await pool.close();
 | `adaptive.increaseStep`   | `number`  | No       | `1`     | Number of concurrency slots added during recovery                                                                 |
 | `adaptive.decreaseFactor` | `number`  | No       | `0.9`   | Multiplicative decrease factor applied during congestion. Must be greater than 0 and less than 1                  |
 | `adaptive.minConcurrency` | `number`  | No       | `1`     | Lower bound for adaptive concurrency. Cannot exceed `concurrency.limit`                                           |
+| `adaptive.initialConcurrency` | `number` | No    | `concurrency.limit` | Starting concurrency for the adaptive algorithm (slow-start). Must be between `minConcurrency` and `concurrency.limit` |
 
 ### Retry Configuration
 
@@ -185,6 +186,7 @@ await pool.close();
 | `retry.maxAttempts` | `number` | No       | `3`     | Maximum total attempts, including the initial request |
 | `retry.delay`       | `number` | No       | `1000`  | Base delay in ms before the first retry             |
 | `retry.factor`      | `number` | No       | `2`     | Exponential backoff factor (delay × factor^attempt) |
+| `retry.maxRetryAfter` | `number` | No     | `60000` | Upper bound in ms for the wait honored from a 429 `Retry-After` header |
 
 ### Network Configuration
 
@@ -285,21 +287,43 @@ Adaptive throttling is **disabled by default**. To enable it, set `adaptive.enab
 When enabled, the pool automatically monitors request latency and slows down when congestion is detected:
 
 -   Calculates an exponential moving average (EMA) of latency
--   If a request is slower than the average multiplied by `adaptive.congestionRatio`, it reduces concurrency
+-   If requests are slower than the average multiplied by `adaptive.congestionRatio` for `adaptive.breachLimit` consecutive samples, it reduces concurrency
 -   When requests become fast again, it restores concurrency gradually
 
 ## Error Handling
 
--   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits
--   **5xx (Server Error)**: Automatic retry
--   **4xx (Client Error)**: No retry is performed (AbortError)
--   **Network Error**: Automatic retry
+-   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits exactly that long (capped at `retry.maxRetryAfter`, default 60s) before retrying — no extra backoff is stacked on top
+-   **5xx (Server Error) and 408 (Request Timeout)**: Automatic retry with exponential backoff
+-   **Other 4xx (Client Error)**: No retry is performed
+-   **Network Error**: Automatic retry with exponential backoff
+-   **AbortSignal**: Pass a `signal` in the request options to cancel a request; an aborted request is never retried, and pending retry waits resolve immediately
+
+HTTP-level failures are thrown as `CallPoolError`, which exposes the response details:
+
+```typescript
+import { CallPool, CallPoolError } from "call-pool";
+
+try {
+    await pool.request("/users/999");
+} catch (err) {
+    if (err instanceof CallPoolError) {
+        err.statusCode; // e.g. 404
+        err.body; // raw response body
+        err.headers; // response headers (Set-Cookie redacted)
+        err.retryable; // whether the pool retried it
+        err.retryAfterMs; // parsed Retry-After (429 only)
+    }
+}
+```
+
+Network-level failures (DNS, connection reset, socket timeout) propagate as the original `undici` errors.
+
+**Backpressure note**: retry waits (backoff and `Retry-After`) happen while the request still occupies its concurrency slot. A retrying request therefore slows the whole pool down — intentional backpressure that prevents hammering a struggling upstream.
 
 ## Dependencies
 
 -   `undici`: High-performance HTTP connection pool
 -   `bottleneck`: Rate limiting and queue management
--   `p-retry`: Retry with exponential backoff
 
 ## TODO
 
