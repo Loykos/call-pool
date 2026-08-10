@@ -68,9 +68,10 @@ describe.concurrent("Configuration Enforcement", () => {
             );
         });
 
-        it("should make close() idempotent", async () => {
+        it("should make close() idempotent and concurrent-safe", async () => {
             const pool = new CallPool({ baseUrl: "http://localhost:59998" });
-            await pool.close();
+            // Concurrent calls must await the same teardown, not resolve early
+            await Promise.all([pool.close(), pool.close()]);
             await expect(pool.close()).resolves.toBeUndefined();
         });
     });

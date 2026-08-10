@@ -97,11 +97,16 @@ export interface CallPoolOptions {
     };
 }
 
-export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin" | "path" | "method" | "body" | "headers"> {
+export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin" | "path" | "method" | "body" | "headers" | "signal"> {
     method?: Dispatcher.HttpMethod;
     priority?: number;
     body?: string | Buffer | Uint8Array | object | null;
     headers?: Record<string, string>;
+    /**
+     * Narrowed to AbortSignal only (undici also accepts a legacy EventEmitter
+     * shape, but the retry loop's abort guards would not see it).
+     */
+    signal?: AbortSignal | null;
 }
 
 // ==========================================
@@ -185,7 +190,7 @@ export class CallPool {
 
     // Limiter State
     private currentConcurrency: number;
-    private closed = false;
+    private closePromise: Promise<void> | null = null;
 
     /**
      * Creates a pool bound to a single base URL. Validates `options` synchronously
@@ -465,10 +470,12 @@ export class CallPool {
     }
 
     private sanitizeHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string | string[] | undefined> {
-        // Redacted before headers can reach a CallPoolError: error serializers
-        // (JSON.stringify, pino, winston) would otherwise leak session cookies.
-        if (headers["set-cookie"] === undefined) return headers;
-        return { ...headers, "set-cookie": "[redacted]" };
+        // Always a fresh copy, so CallPoolError never aliases undici's response
+        // object. Set-Cookie is redacted before headers can reach an error
+        // serializer (JSON.stringify, pino, winston) and leak session cookies.
+        const copy = { ...headers };
+        if (copy["set-cookie"] !== undefined) copy["set-cookie"] = "[redacted]";
+        return copy;
     }
 
     private assertSuccess(statusCode: number, rawBody: string, resHeaders: Record<string, string | string[] | undefined>): void {
@@ -653,12 +660,14 @@ export class CallPool {
     /**
      * Shuts the pool down: queued (not yet started) requests are rejected,
      * in-flight requests are awaited, then the underlying sockets are closed.
-     * Idempotent: subsequent calls are no-ops.
+     * Idempotent and concurrent-safe: every call awaits the same teardown.
      */
     public async close(): Promise<void> {
-        if (this.closed) return;
-        this.closed = true;
+        this.closePromise ??= this.doClose();
+        return this.closePromise;
+    }
 
+    private async doClose(): Promise<void> {
         if (this.pendingUpdateTimer) {
             clearTimeout(this.pendingUpdateTimer);
             this.pendingUpdateTimer = null;

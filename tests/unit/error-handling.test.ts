@@ -16,7 +16,7 @@ describe.concurrent("Error Handling", () => {
 
             const pool = new CallPool({
                 baseUrl,
-                retry: { delay: 500 }, // p-retry will add this to forceWait
+                retry: { delay: 500 }, // backoff fallback, unused when Retry-After is present
             });
 
             try {
@@ -24,9 +24,9 @@ describe.concurrent("Error Handling", () => {
                 await pool.request("/test-429");
                 const duration = Date.now() - start;
 
-                // Explanation: 2s (Retry-After) + ~0.5s (p-retry delay).
-                // The upper bound proves the header was honored: falling back to
-                // the 5s default would push the total past 5.5s.
+                // The Retry-After wait (2s) is honored exactly - no backoff is
+                // stacked on top. The upper bound proves the header was used:
+                // the 5s no-header default would push the total past 5s.
                 expect(duration).toBeGreaterThanOrEqual(2000);
                 expect(duration).toBeLessThan(4500);
                 expect(mockServer.getRequestCount()).toBe(2);
