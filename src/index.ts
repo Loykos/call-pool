@@ -1,5 +1,4 @@
 import { Pool, Dispatcher } from "undici";
-import Bottleneck from "bottleneck";
 
 // ==========================================
 // CONFIGURATION TYPES
@@ -150,12 +149,208 @@ export class CallPoolError extends Error {
 }
 
 // ==========================================
+// INTERNAL SCHEDULER
+// ==========================================
+
+/** Live snapshot of the pool's scheduling state; see {@link CallPool.getStats}. */
+export interface CallPoolStats {
+    /** Jobs waiting in the priority queue */
+    queued: number;
+    /** Jobs currently executing (a retrying request still occupies its slot) */
+    running: number;
+    /** Current concurrency limit (dynamically tuned when adaptive is enabled) */
+    concurrency: number;
+}
+
+interface ScheduledJob {
+    task: () => Promise<unknown>;
+    resolve: (value: unknown) => void;
+    reject: (reason: unknown) => void;
+}
+
+interface PriorityBucket {
+    jobs: Array<ScheduledJob | undefined>;
+    head: number;
+}
+
+const PRIORITY_LEVELS = 10;
+const PRIORITY_BUCKET_COMPACT_AT = 1024;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * In-process job scheduler: mutable concurrency semaphore, FIFO priority
+ * buckets (0 runs first), `minTime` spacing between job starts and a
+ * fixed-window quota anchored at construction time.
+ *
+ * Job starts are driven by completions plus a single wake timer armed no later
+ * than the earliest constraint deadline — no polling and no per-job timers, so
+ * dequeue cost stays in the microsecond range regardless of throughput.
+ * The queue is unbounded by design: backpressure belongs to the caller.
+ */
+class RequestScheduler {
+    private maxConcurrent: number;
+    private readonly minTime: number;
+    private readonly quota: { max: number; window: number } | null;
+    private readonly epoch = performance.now();
+
+    private readonly queues: PriorityBucket[] = Array.from({ length: PRIORITY_LEVELS }, () => ({ jobs: [], head: 0 }));
+    private queuedCount = 0;
+    private runningCount = 0;
+
+    /** Remaining quota tokens in the current window (Infinity without quota) */
+    private tokens: number;
+    private windowIndex = 0;
+    private lastStartAt = -Infinity;
+
+    private wakeTimer: NodeJS.Timeout | null = null;
+    private stopped = false;
+    private onDrained: (() => void) | null = null;
+
+    constructor(options: { maxConcurrent: number; minTime: number; quota?: { max: number; window: number } }) {
+        this.maxConcurrent = options.maxConcurrent;
+        this.minTime = options.minTime;
+        this.quota = options.quota ?? null;
+        this.tokens = this.quota?.max ?? Infinity;
+    }
+
+    get queued(): number {
+        return this.queuedCount;
+    }
+
+    get running(): number {
+        return this.runningCount;
+    }
+
+    schedule<T>(priority: number, task: () => Promise<T>): Promise<T> {
+        if (this.stopped) return Promise.reject(new Error("[CallPool] Pool is closed"));
+        return new Promise<T>((resolve, reject) => {
+            this.queues[priority].jobs.push({ task, resolve: resolve as (value: unknown) => void, reject });
+            this.queuedCount++;
+            this.dispatch();
+        });
+    }
+
+    setMaxConcurrent(limit: number): void {
+        this.maxConcurrent = limit;
+        this.dispatch();
+    }
+
+    /** Rejects every queued job and resolves once in-flight jobs have settled. */
+    stop(): Promise<void> {
+        this.stopped = true;
+        this.clearWakeTimer();
+
+        const closed = new Error("[CallPool] Pool is closed");
+        for (const bucket of this.queues) {
+            for (let index = bucket.head; index < bucket.jobs.length; index++) {
+                bucket.jobs[index]?.reject(closed);
+            }
+            bucket.jobs = [];
+            bucket.head = 0;
+        }
+        this.queuedCount = 0;
+
+        if (this.runningCount === 0) return Promise.resolve();
+        return new Promise(resolve => {
+            this.onDrained = resolve;
+        });
+    }
+
+    private dispatch(): void {
+        while (this.runningCount < this.maxConcurrent && this.queuedCount > 0) {
+            const wait = this.startDelay(performance.now());
+            if (wait > 0) return this.wake(wait);
+            this.runNext();
+        }
+    }
+
+    /** Milliseconds until the next job may start (0 = start now). */
+    private startDelay(now: number): number {
+        const spacingWait = this.lastStartAt + this.minTime - now;
+        return Math.max(spacingWait, this.quotaWait(now), 0);
+    }
+
+    private quotaWait(now: number): number {
+        if (!this.quota) return 0;
+
+        // Lazy fixed-window refill: no interval timer to leak or unref.
+        const elapsedWindows = Math.floor((now - this.epoch) / this.quota.window);
+        if (elapsedWindows > this.windowIndex) {
+            this.windowIndex = elapsedWindows;
+            this.tokens = this.quota.max;
+        }
+
+        if (this.tokens > 0) return 0;
+        return this.epoch + (this.windowIndex + 1) * this.quota.window - now;
+    }
+
+    private runNext(): void {
+        const job = this.takeNext();
+        if (!job) return;
+
+        this.lastStartAt = performance.now();
+        this.tokens--;
+        this.runningCount++;
+        job.task().then(job.resolve, job.reject).finally(() => this.onJobSettled());
+    }
+
+    private takeNext(): ScheduledJob | undefined {
+        for (const bucket of this.queues) {
+            if (bucket.head >= bucket.jobs.length) continue;
+
+            const job = bucket.jobs[bucket.head];
+            bucket.jobs[bucket.head] = undefined;
+            bucket.head++;
+            this.queuedCount--;
+
+            if (bucket.head === bucket.jobs.length) {
+                bucket.jobs = [];
+                bucket.head = 0;
+            } else if (bucket.head >= PRIORITY_BUCKET_COMPACT_AT && bucket.head * 2 >= bucket.jobs.length) {
+                bucket.jobs = bucket.jobs.slice(bucket.head);
+                bucket.head = 0;
+            }
+
+            return job;
+        }
+        return undefined;
+    }
+
+    private onJobSettled(): void {
+        this.runningCount--;
+        if (!this.stopped) return this.dispatch();
+        if (this.runningCount === 0) this.onDrained?.();
+    }
+
+    /**
+     * Arms the wake timer. Constraint deadlines (`lastStartAt + minTime`, next
+     * window boundary) only move forward while jobs are blocked, so an already
+     * armed timer never fires after the earliest possible start. Waits beyond
+     * Node's timer limit are chunked; on fire, dispatch recomputes the remaining
+     * delay and re-arms if the job is still blocked.
+     */
+    private wake(delayMs: number): void {
+        if (this.wakeTimer) return;
+        this.wakeTimer = setTimeout(() => {
+            this.wakeTimer = null;
+            this.dispatch();
+        }, Math.min(delayMs, MAX_TIMER_DELAY_MS));
+    }
+
+    private clearWakeTimer(): void {
+        if (!this.wakeTimer) return;
+        clearTimeout(this.wakeTimer);
+        this.wakeTimer = null;
+    }
+}
+
+// ==========================================
 // MAIN CLASS
 // ==========================================
 
 export class CallPool {
     private client: Pool;
-    private limiter: Bottleneck;
+    private scheduler: RequestScheduler;
 
     // Runtime Config
     private maxAttempts: number;
@@ -234,11 +429,13 @@ export class CallPool {
         // start at the maximum.
         this.currentConcurrency = this.adaptiveEnabled ? (adaptOpts?.initialConcurrency ?? this.maxConcurrency) : this.maxConcurrency;
 
-        // --- 4. SETUP UNDICI & BOTTLENECK ---
+        // --- 4. SETUP UNDICI & SCHEDULER ---
         this.client = this.createClient(options.baseUrl, concurrencyLimit);
-        this.limiter = this.createLimiter(this.computeBaseMinTime(rateOpts), rateOpts?.quota);
-
-        this.setupMonitoring();
+        this.scheduler = new RequestScheduler({
+            maxConcurrent: this.currentConcurrency,
+            minTime: this.computeBaseMinTime(rateOpts),
+            quota: rateOpts?.quota,
+        });
     }
 
     private computeBaseMinTime(rateOpts: CallPoolOptions["rateLimit"]): number {
@@ -253,26 +450,6 @@ export class CallPool {
             connections,
             pipelining: 1,
             keepAliveTimeout: 10_000,
-        });
-    }
-
-    private createLimiter(minTime: number, quota?: { max: number; window: number }): Bottleneck {
-        // Starts with the current adaptive concurrency.
-        // No highWater cap: with a bounded queue Bottleneck's BLOCK strategy
-        // drops EVERY queued job once the threshold is hit, silently rejecting
-        // all pending work. The queue is unbounded by design.
-        return new Bottleneck({
-            maxConcurrent: this.currentConcurrency,
-            minTime,
-            reservoir: quota?.max ?? null,
-            reservoirRefreshAmount: quota?.max ?? null,
-            reservoirRefreshInterval: quota?.window ?? null,
-        });
-    }
-
-    private setupMonitoring() {
-        this.limiter.on("error", err => {
-            if (process.env.NODE_ENV !== "production") console.error("[CallPool] Limiter Error:", err);
         });
     }
 
@@ -399,7 +576,7 @@ export class CallPool {
         if (!Number.isInteger(priority) || priority < 0 || priority > 9) {
             throw new Error("[CallPool] 'priority' must be an integer between 0 and 9");
         }
-        return this.limiter.schedule({ priority }, () => this.executeWithRetry<T>(path, reqOpts));
+        return this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, reqOpts));
     }
 
     private async executeWithRetry<T>(path: string, reqOpts: Omit<RequestOptions, "priority">): Promise<T> {
@@ -645,7 +822,7 @@ export class CallPool {
         }
 
         this.lastSettingsUpdate = performance.now();
-        this.limiter.updateSettings({ maxConcurrent: this.currentConcurrency });
+        this.scheduler.setMaxConcurrent(this.currentConcurrency);
     }
 
     /**
@@ -655,6 +832,18 @@ export class CallPool {
      */
     public getCurrentConcurrency(): number {
         return this.currentConcurrency;
+    }
+
+    /**
+     * Returns a live snapshot of the pool: queued jobs, in-flight jobs and the
+     * current concurrency limit.
+     */
+    public getStats(): CallPoolStats {
+        return {
+            queued: this.scheduler.queued,
+            running: this.scheduler.running,
+            concurrency: this.currentConcurrency,
+        };
     }
 
     /**
@@ -672,7 +861,7 @@ export class CallPool {
             clearTimeout(this.pendingUpdateTimer);
             this.pendingUpdateTimer = null;
         }
-        await this.limiter.stop();
+        await this.scheduler.stop();
         await this.client.close();
     }
 }

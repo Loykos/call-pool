@@ -1,6 +1,6 @@
 {
     "name": "call-pool",
-    "version": "0.0.0",
+    "version": "0.1.0",
     "description": "HTTP request pool con rate limiting, retry e adaptive throttling",
     "type": "module",
     "main": "./dist/index.js",
@@ -43,7 +43,7 @@
         "retry",
         "undici"
     ],
-    "author": "",
+    "author": "Andrea Moraglia (https://github.com/Loykos)",
     "license": "MIT",
     "sideEffects": false,
     "publishConfig": {
@@ -58,7 +58,6 @@
     },
     "homepage": "https://github.com/Loykos/call-pool#readme",
     "dependencies": {
-        "bottleneck": "^2.19.5",
         "undici": "^6.19.8"
     },
     "devDependencies": {

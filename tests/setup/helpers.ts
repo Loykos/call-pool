@@ -69,12 +69,12 @@ export function percentile(values: number[], p: number) {
     return sorted[idx];
 }
 
-/** aspetta che Bottleneck svuoti coda e running (con timeout) */
-export async function drainPool(pool: any, timeoutMs = 5000) {
+/** aspetta che il pool svuoti coda e running (con timeout) */
+export async function drainPool(pool: { getStats(): { queued: number; running: number } }, timeoutMs = 5000) {
     const start = performance.now();
     while (performance.now() - start < timeoutMs) {
-        const counts = pool.limiter.counts();
-        if (counts.QUEUED === 0 && counts.RUNNING === 0) return;
+        const stats = pool.getStats();
+        if (stats.queued === 0 && stats.running === 0) return;
         await sleep(20);
     }
     // se non drena entro timeout, ok: non blocchiamo il test all’infinito
