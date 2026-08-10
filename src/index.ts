@@ -168,16 +168,23 @@ interface ScheduledJob {
     reject: (reason: unknown) => void;
 }
 
+interface PriorityBucket {
+    jobs: Array<ScheduledJob | undefined>;
+    head: number;
+}
+
 const PRIORITY_LEVELS = 10;
+const PRIORITY_BUCKET_COMPACT_AT = 1024;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /**
  * In-process job scheduler: mutable concurrency semaphore, FIFO priority
  * buckets (0 runs first), `minTime` spacing between job starts and a
  * fixed-window quota anchored at construction time.
  *
- * Job starts are driven by completions plus a single wake timer armed on the
- * earliest constraint deadline — no polling and no per-job timers, so dequeue
- * cost stays in the microsecond range regardless of throughput.
+ * Job starts are driven by completions plus a single wake timer armed no later
+ * than the earliest constraint deadline — no polling and no per-job timers, so
+ * dequeue cost stays in the microsecond range regardless of throughput.
  * The queue is unbounded by design: backpressure belongs to the caller.
  */
 class RequestScheduler {
@@ -186,7 +193,7 @@ class RequestScheduler {
     private readonly quota: { max: number; window: number } | null;
     private readonly epoch = performance.now();
 
-    private readonly queues: ScheduledJob[][] = Array.from({ length: PRIORITY_LEVELS }, () => []);
+    private readonly queues: PriorityBucket[] = Array.from({ length: PRIORITY_LEVELS }, () => ({ jobs: [], head: 0 }));
     private queuedCount = 0;
     private runningCount = 0;
 
@@ -217,7 +224,7 @@ class RequestScheduler {
     schedule<T>(priority: number, task: () => Promise<T>): Promise<T> {
         if (this.stopped) return Promise.reject(new Error("[CallPool] Pool is closed"));
         return new Promise<T>((resolve, reject) => {
-            this.queues[priority].push({ task, resolve: resolve as (value: unknown) => void, reject });
+            this.queues[priority].jobs.push({ task, resolve: resolve as (value: unknown) => void, reject });
             this.queuedCount++;
             this.dispatch();
         });
@@ -235,7 +242,11 @@ class RequestScheduler {
 
         const closed = new Error("[CallPool] Pool is closed");
         for (const bucket of this.queues) {
-            for (const job of bucket.splice(0)) job.reject(closed);
+            for (let index = bucket.head; index < bucket.jobs.length; index++) {
+                bucket.jobs[index]?.reject(closed);
+            }
+            bucket.jobs = [];
+            bucket.head = 0;
         }
         this.queuedCount = 0;
 
@@ -285,9 +296,22 @@ class RequestScheduler {
 
     private takeNext(): ScheduledJob | undefined {
         for (const bucket of this.queues) {
-            if (bucket.length === 0) continue;
+            if (bucket.head >= bucket.jobs.length) continue;
+
+            const job = bucket.jobs[bucket.head];
+            bucket.jobs[bucket.head] = undefined;
+            bucket.head++;
             this.queuedCount--;
-            return bucket.shift();
+
+            if (bucket.head === bucket.jobs.length) {
+                bucket.jobs = [];
+                bucket.head = 0;
+            } else if (bucket.head >= PRIORITY_BUCKET_COMPACT_AT && bucket.head * 2 >= bucket.jobs.length) {
+                bucket.jobs = bucket.jobs.slice(bucket.head);
+                bucket.head = 0;
+            }
+
+            return job;
         }
         return undefined;
     }
@@ -301,15 +325,16 @@ class RequestScheduler {
     /**
      * Arms the wake timer. Constraint deadlines (`lastStartAt + minTime`, next
      * window boundary) only move forward while jobs are blocked, so an already
-     * armed timer always targets the earliest possible start: on fire, dispatch
-     * recomputes the delay and re-arms if still blocked.
+     * armed timer never fires after the earliest possible start. Waits beyond
+     * Node's timer limit are chunked; on fire, dispatch recomputes the remaining
+     * delay and re-arms if the job is still blocked.
      */
     private wake(delayMs: number): void {
         if (this.wakeTimer) return;
         this.wakeTimer = setTimeout(() => {
             this.wakeTimer = null;
             this.dispatch();
-        }, delayMs);
+        }, Math.min(delayMs, MAX_TIMER_DELAY_MS));
     }
 
     private clearWakeTimer(): void {
