@@ -6,6 +6,31 @@ import { MockServer } from "../setup/mock-server";
 const wait = (ms: number) => new Promise(res => setTimeout(res, ms));
 
 describe.concurrent("Quota Enforcement & Rate Limiting", () => {
+    it("counts every retry attempt against the quota", async () => {
+        const mockServer = new MockServer();
+        const baseUrl = await mockServer.start({ statusCode: 500 });
+        const pool = new CallPool({
+            baseUrl,
+            concurrency: { limit: 3 },
+            rateLimit: { quota: { max: 2, window: 1000 } },
+            retry: { maxAttempts: 4, delay: 0 },
+        });
+        const jobs = Array.from({ length: 3 }, (_, index) => pool.request(`/retry-${index}`));
+        const settled = Promise.allSettled(jobs);
+
+        try {
+            await wait(100);
+            expect(mockServer.getRequestCount()).toBe(2);
+
+            const closeStartedAt = performance.now();
+            await pool.close();
+            expect(performance.now() - closeStartedAt).toBeLessThan(250);
+            await settled;
+        } finally {
+            await Promise.all([pool.close(), mockServer.stop()]);
+        }
+    });
+
     describe("High-Latency Quota Logic", () => {
         it("should strictly enforce quota over multiple windows", async () => {
             const mockServer = new MockServer();
