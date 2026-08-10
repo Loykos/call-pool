@@ -1,6 +1,6 @@
 {
     "name": "call-pool",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "HTTP request pool con rate limiting, retry e adaptive throttling",
     "type": "module",
     "main": "./dist/index.js",
