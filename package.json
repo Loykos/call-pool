@@ -58,7 +58,6 @@
     },
     "homepage": "https://github.com/Loykos/call-pool#readme",
     "dependencies": {
-        "bottleneck": "^2.19.5",
         "undici": "^6.19.8"
     },
     "devDependencies": {

@@ -15,7 +15,7 @@ The tool uses a **Real-Time Adaptive Throttling** feature (based on the **EMA al
 ## Features
 
 -   **HTTP Connection Pool**: Uses [`undici`](https://github.com/nodejs/undici) to efficiently manage TCP connections
--   **Rate Limiting**: Leverages [`bottleneck`](https://github.com/SGrondin/bottleneck) for precise quota management, supporting both fixed windows and "auto" distribution
+-   **Rate Limiting**: In-process priority scheduler with precise quota management, supporting both fixed windows and "auto" distribution
 -   **Adaptive Throttling**: Real-time latency monitoring. It automatically slows down when the upstream service starts to lag, preventing 429s and timeouts
 -   **Automatic Retry**: Built-in exponential backoff for network and server errors, with `Retry-After` header and `AbortSignal` support
 
@@ -290,6 +290,11 @@ When enabled, the pool automatically monitors request latency and slows down whe
 -   If requests are slower than the average multiplied by `adaptive.congestionRatio` for `adaptive.breachLimit` consecutive samples, it reduces concurrency
 -   When requests become fast again, it restores concurrency gradually
 
+## Introspection
+
+-   `pool.getCurrentConcurrency()`: current concurrency limit (the live adaptive value when adaptive throttling is enabled)
+-   `pool.getStats()`: live snapshot of the pool — `{ queued, running, concurrency }`
+
 ## Error Handling
 
 -   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits exactly that long (capped at `retry.maxRetryAfter`, default 60s) before retrying — no extra backoff is stacked on top
@@ -323,7 +328,8 @@ Network-level failures (DNS, connection reset, socket timeout) propagate as the 
 ## Dependencies
 
 -   `undici`: High-performance HTTP connection pool
--   `bottleneck`: Rate limiting and queue management
+
+Rate limiting, priority queueing and quota management are implemented in-process with zero additional dependencies.
 
 ## TODO
 
