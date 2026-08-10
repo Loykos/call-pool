@@ -91,6 +91,24 @@ describe.concurrent("Parsing Logic", () => {
                 await Promise.all([pool.close(), mockServer.stop()]);
             }
         });
+
+        it("should preserve binary response bytes", async () => {
+            const mockServer = new MockServer();
+            const payload = Buffer.from([0x00, 0xff, 0x80, 0xc3, 0x28, 0x41]);
+            const baseUrl = await mockServer.start({
+                headers: { "Content-Type": "application/octet-stream" },
+                body: payload,
+            });
+            const pool = new CallPool({ baseUrl });
+
+            try {
+                const result = await pool.request<Buffer>("/binary");
+                expect(Buffer.isBuffer(result)).toBe(true);
+                expect(result.toString("hex")).toBe("00ff80c32841");
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
     });
 
     describe("Edge Cases & Empty Bodies", () => {

@@ -5,7 +5,7 @@ export interface MockServerOptions {
     latency?: number | (() => number);
     statusCode?: number | (() => number);
     headers?: Record<string, string> | (() => Record<string, string>);
-    body?: string | object;
+    body?: string | Buffer | object;
 
     /** chiamato quando la richiesta è stata ricevuta e parsed (subito prima di simulare latenza) */
     onRequestStart?: (req: any) => void;
@@ -59,7 +59,7 @@ export class MockServer {
                     // Body risposta
                     const responseBody =
                         options.body !== undefined
-                            ? typeof options.body === "string"
+                            ? typeof options.body === "string" || Buffer.isBuffer(options.body)
                                 ? options.body
                                 : JSON.stringify(options.body)
                             : JSON.stringify({ success: true });

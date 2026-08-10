@@ -199,7 +199,7 @@ await pool.close();
 
 Options for individual requests passed to the `request()` method.
 
-**Note**: JSON parsing is automatic. If the response `Content-Type` header contains `application/json`, the response body is automatically parsed as JSON. Otherwise, it returns the raw text. Request bodies that are JavaScript objects are automatically serialized to JSON with the appropriate `Content-Type` header.
+**Note**: Response parsing is automatic. If `Content-Type` contains `application/json`, the body is parsed as JSON. Textual media types and responses without `Content-Type` return a string; binary media types return a byte-preserving `Buffer`. Request bodies that are JavaScript objects are automatically serialized to JSON with the appropriate `Content-Type` header.
 
 ### Example
 
@@ -301,6 +301,7 @@ When enabled, the pool automatically monitors request latency and slows down whe
 -   **5xx (Server Error) and 408 (Request Timeout)**: Automatic retry with exponential backoff
 -   **Other 4xx (Client Error)**: No retry is performed
 -   **Network Error**: Automatic retry with exponential backoff
+-   **Invalid local request arguments**: Propagated immediately without retry
 -   **AbortSignal**: Pass a `signal` in the request options to cancel a request; an aborted request is never retried, and pending retry waits resolve immediately
 
 HTTP-level failures are thrown as `CallPoolError`, which exposes the response details:
@@ -323,7 +324,7 @@ try {
 
 Network-level failures (DNS, connection reset, socket timeout) propagate as the original `undici` errors.
 
-**Backpressure note**: retry waits (backoff and `Retry-After`) happen while the request still occupies its concurrency slot. A retrying request therefore slows the whole pool down — intentional backpressure that prevents hammering a struggling upstream.
+**Backpressure note**: retry waits (backoff and `Retry-After`) happen while the logical request still occupies its concurrency slot. A retrying request therefore slows the whole pool down — intentional backpressure that prevents hammering a struggling upstream. Rate limits are acquired separately for every HTTP attempt, so retries count against `minTime` and quota just like initial attempts.
 
 ## Dependencies
 

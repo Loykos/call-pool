@@ -8,10 +8,20 @@ interface SchedulerHarness {
     takeNext(): { task: () => Promise<unknown> } | undefined;
 }
 
+interface RateGateHarness {
+    acquire(): Promise<void>;
+}
+
 function createScheduler(options: ConstructorParameters<typeof CallPool>[0] = { baseUrl: "http://localhost" }) {
     const pool = new CallPool(options);
     const scheduler = (pool as unknown as { scheduler: SchedulerHarness }).scheduler;
     return { pool, scheduler };
+}
+
+function createRateGate(rateLimit: NonNullable<ConstructorParameters<typeof CallPool>[0]["rateLimit"]>) {
+    const pool = new CallPool({ baseUrl: "http://localhost", rateLimit });
+    const rateGate = (pool as unknown as { rateGate: RateGateHarness }).rateGate;
+    return { pool, rateGate };
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -31,14 +41,10 @@ describe("RequestScheduler regressions", () => {
     ] as const)("chunks %s waits that exceed Node's maximum timer delay", async (_scenario, rateLimit) => {
         vi.useFakeTimers();
         const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
-        const { pool, scheduler } = createScheduler({
-            baseUrl: "http://localhost",
-            concurrency: { limit: 1 },
-            rateLimit,
-        });
+        const { pool, rateGate } = createRateGate(rateLimit);
 
-        const first = scheduler.schedule(5, async () => undefined);
-        const second = scheduler.schedule(5, async () => undefined);
+        const first = rateGate.acquire();
+        const second = rateGate.acquire();
         const secondError = second.catch(error => error as Error);
 
         await first;

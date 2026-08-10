@@ -118,6 +118,25 @@ describe.concurrent("Retry Suite", () => {
     });
 
     describe("Network Errors", () => {
+        it("does not retry invalid undici arguments", async () => {
+            const pool = new CallPool({
+                baseUrl: "http://localhost",
+                retry: { maxAttempts: 4, delay: 200 },
+            });
+
+            try {
+                const startedAt = performance.now();
+                await expect(pool.request("relative-path")).rejects.toMatchObject({
+                    name: "InvalidArgumentError",
+                    message: "path must be an absolute URL or start with a slash",
+                    code: "UND_ERR_INVALID_ARG",
+                });
+                expect(performance.now() - startedAt).toBeLessThan(150);
+            } finally {
+                await pool.close();
+            }
+        });
+
         it("should retry on connection refused", async () => {
             // Porta non esistente per forzare errore di rete
             const pool = new CallPool({

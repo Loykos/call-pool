@@ -1,4 +1,4 @@
-import { Pool, Dispatcher } from "undici";
+import { Pool, Dispatcher, errors } from "undici";
 
 // ==========================================
 // CONFIGURATION TYPES
@@ -173,44 +173,150 @@ interface PriorityBucket {
     head: number;
 }
 
+interface RateWaiter {
+    resolve: () => void;
+    reject: (reason: unknown) => void;
+}
+
+class PoolClosedError extends Error {
+    constructor() {
+        super("[CallPool] Pool is closed");
+        this.name = "Error";
+    }
+}
+
 const PRIORITY_LEVELS = 10;
 const PRIORITY_BUCKET_COMPACT_AT = 1024;
+const RATE_QUEUE_COMPACT_AT = 1024;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /**
- * In-process job scheduler: mutable concurrency semaphore, FIFO priority
- * buckets (0 runs first), `minTime` spacing between job starts and a
- * fixed-window quota anchored at construction time.
- *
- * Job starts are driven by completions plus a single wake timer armed no later
- * than the earliest constraint deadline — no polling and no per-job timers, so
- * dequeue cost stays in the microsecond range regardless of throughput.
- * The queue is unbounded by design: backpressure belongs to the caller.
+ * Serializes permission to start individual HTTP attempts. Unlike the request
+ * scheduler, this gate is entered again for every retry so contractual limits
+ * count actual upstream traffic rather than logical jobs.
  */
-class RequestScheduler {
-    private maxConcurrent: number;
+class RateGate {
     private readonly minTime: number;
     private readonly quota: { max: number; window: number } | null;
     private readonly epoch = performance.now();
+    private readonly waiters: Array<RateWaiter | undefined> = [];
+
+    private head = 0;
+    private tokens: number;
+    private windowIndex = 0;
+    private lastStartAt = -Infinity;
+    private wakeTimer: NodeJS.Timeout | null = null;
+    private stopped = false;
+
+    constructor(options: { minTime: number; quota?: { max: number; window: number } }) {
+        this.minTime = options.minTime;
+        this.quota = options.quota ?? null;
+        this.tokens = this.quota?.max ?? Infinity;
+    }
+
+    acquire(): Promise<void> {
+        if (this.stopped) return Promise.reject(new PoolClosedError());
+        return new Promise<void>((resolve, reject) => {
+            this.waiters.push({ resolve, reject });
+            this.dispatch();
+        });
+    }
+
+    stop(): void {
+        if (this.stopped) return;
+        this.stopped = true;
+        this.clearWakeTimer();
+
+        const closed = new PoolClosedError();
+        for (let index = this.head; index < this.waiters.length; index++) {
+            this.waiters[index]?.reject(closed);
+        }
+        this.waiters.length = 0;
+        this.head = 0;
+    }
+
+    private dispatch(): void {
+        while (!this.stopped && this.head < this.waiters.length) {
+            const wait = this.startDelay(performance.now());
+            if (wait > 0) return this.wake(wait);
+
+            const waiter = this.takeNext();
+            if (!waiter) return;
+            this.lastStartAt = performance.now();
+            this.tokens--;
+            waiter.resolve();
+        }
+    }
+
+    private startDelay(now: number): number {
+        const spacingWait = this.lastStartAt + this.minTime - now;
+        return Math.max(spacingWait, this.quotaWait(now), 0);
+    }
+
+    private quotaWait(now: number): number {
+        if (!this.quota) return 0;
+
+        const elapsedWindows = Math.floor((now - this.epoch) / this.quota.window);
+        if (elapsedWindows > this.windowIndex) {
+            this.windowIndex = elapsedWindows;
+            this.tokens = this.quota.max;
+        }
+
+        if (this.tokens > 0) return 0;
+        return this.epoch + (this.windowIndex + 1) * this.quota.window - now;
+    }
+
+    private takeNext(): RateWaiter | undefined {
+        const waiter = this.waiters[this.head];
+        this.waiters[this.head] = undefined;
+        this.head++;
+
+        if (this.head === this.waiters.length) {
+            this.waiters.length = 0;
+            this.head = 0;
+        } else if (this.head >= RATE_QUEUE_COMPACT_AT && this.head * 2 >= this.waiters.length) {
+            this.waiters.splice(0, this.head);
+            this.head = 0;
+        }
+
+        return waiter;
+    }
+
+    private wake(delayMs: number): void {
+        if (this.wakeTimer) return;
+        this.wakeTimer = setTimeout(() => {
+            this.wakeTimer = null;
+            this.dispatch();
+        }, Math.min(delayMs, MAX_TIMER_DELAY_MS));
+    }
+
+    private clearWakeTimer(): void {
+        if (!this.wakeTimer) return;
+        clearTimeout(this.wakeTimer);
+        this.wakeTimer = null;
+    }
+}
+
+/**
+ * In-process logical-job scheduler: mutable concurrency semaphore and FIFO
+ * priority buckets (0 runs first). Rate constraints live in RateGate because
+ * they apply to every HTTP attempt, including retries.
+ *
+ * Job starts are driven by completions with no polling. The queue is unbounded
+ * by design: backpressure belongs to the caller.
+ */
+class RequestScheduler {
+    private maxConcurrent: number;
 
     private readonly queues: PriorityBucket[] = Array.from({ length: PRIORITY_LEVELS }, () => ({ jobs: [], head: 0 }));
     private queuedCount = 0;
     private runningCount = 0;
 
-    /** Remaining quota tokens in the current window (Infinity without quota) */
-    private tokens: number;
-    private windowIndex = 0;
-    private lastStartAt = -Infinity;
-
-    private wakeTimer: NodeJS.Timeout | null = null;
     private stopped = false;
     private onDrained: (() => void) | null = null;
 
-    constructor(options: { maxConcurrent: number; minTime: number; quota?: { max: number; window: number } }) {
+    constructor(options: { maxConcurrent: number }) {
         this.maxConcurrent = options.maxConcurrent;
-        this.minTime = options.minTime;
-        this.quota = options.quota ?? null;
-        this.tokens = this.quota?.max ?? Infinity;
     }
 
     get queued(): number {
@@ -238,9 +344,8 @@ class RequestScheduler {
     /** Rejects every queued job and resolves once in-flight jobs have settled. */
     stop(): Promise<void> {
         this.stopped = true;
-        this.clearWakeTimer();
 
-        const closed = new Error("[CallPool] Pool is closed");
+        const closed = new PoolClosedError();
         for (const bucket of this.queues) {
             for (let index = bucket.head; index < bucket.jobs.length; index++) {
                 bucket.jobs[index]?.reject(closed);
@@ -258,38 +363,14 @@ class RequestScheduler {
 
     private dispatch(): void {
         while (this.runningCount < this.maxConcurrent && this.queuedCount > 0) {
-            const wait = this.startDelay(performance.now());
-            if (wait > 0) return this.wake(wait);
             this.runNext();
         }
-    }
-
-    /** Milliseconds until the next job may start (0 = start now). */
-    private startDelay(now: number): number {
-        const spacingWait = this.lastStartAt + this.minTime - now;
-        return Math.max(spacingWait, this.quotaWait(now), 0);
-    }
-
-    private quotaWait(now: number): number {
-        if (!this.quota) return 0;
-
-        // Lazy fixed-window refill: no interval timer to leak or unref.
-        const elapsedWindows = Math.floor((now - this.epoch) / this.quota.window);
-        if (elapsedWindows > this.windowIndex) {
-            this.windowIndex = elapsedWindows;
-            this.tokens = this.quota.max;
-        }
-
-        if (this.tokens > 0) return 0;
-        return this.epoch + (this.windowIndex + 1) * this.quota.window - now;
     }
 
     private runNext(): void {
         const job = this.takeNext();
         if (!job) return;
 
-        this.lastStartAt = performance.now();
-        this.tokens--;
         this.runningCount++;
         job.task().then(job.resolve, job.reject).finally(() => this.onJobSettled());
     }
@@ -322,26 +403,6 @@ class RequestScheduler {
         if (this.runningCount === 0) this.onDrained?.();
     }
 
-    /**
-     * Arms the wake timer. Constraint deadlines (`lastStartAt + minTime`, next
-     * window boundary) only move forward while jobs are blocked, so an already
-     * armed timer never fires after the earliest possible start. Waits beyond
-     * Node's timer limit are chunked; on fire, dispatch recomputes the remaining
-     * delay and re-arms if the job is still blocked.
-     */
-    private wake(delayMs: number): void {
-        if (this.wakeTimer) return;
-        this.wakeTimer = setTimeout(() => {
-            this.wakeTimer = null;
-            this.dispatch();
-        }, Math.min(delayMs, MAX_TIMER_DELAY_MS));
-    }
-
-    private clearWakeTimer(): void {
-        if (!this.wakeTimer) return;
-        clearTimeout(this.wakeTimer);
-        this.wakeTimer = null;
-    }
 }
 
 // ==========================================
@@ -351,6 +412,7 @@ class RequestScheduler {
 export class CallPool {
     private client: Pool;
     private scheduler: RequestScheduler;
+    private rateGate: RateGate | null;
 
     // Runtime Config
     private maxAttempts: number;
@@ -431,11 +493,9 @@ export class CallPool {
 
         // --- 4. SETUP UNDICI & SCHEDULER ---
         this.client = this.createClient(options.baseUrl, concurrencyLimit);
-        this.scheduler = new RequestScheduler({
-            maxConcurrent: this.currentConcurrency,
-            minTime: this.computeBaseMinTime(rateOpts),
-            quota: rateOpts?.quota,
-        });
+        this.scheduler = new RequestScheduler({ maxConcurrent: this.currentConcurrency });
+        const minTime = this.computeBaseMinTime(rateOpts);
+        this.rateGate = minTime > 0 || rateOpts?.quota ? new RateGate({ minTime, quota: rateOpts?.quota }) : null;
     }
 
     private computeBaseMinTime(rateOpts: CallPoolOptions["rateLimit"]): number {
@@ -558,7 +618,8 @@ export class CallPool {
      * automatic retries on transient failures.
      *
      * Resolves with the response body parsed as JSON when the response's
-     * `Content-Type` is `application/json`, otherwise with the raw body as a string.
+     * `Content-Type` is `application/json`, as a string for textual content, or
+     * as a byte-preserving Buffer for binary content.
      * HTTP failures (4xx/5xx) reject with {@link CallPoolError}; retryable failures
      * (429, 408, 5xx) are retried up to `retry.maxAttempts`, honoring a capped
      * `Retry-After` wait on 429s. Network-level errors (DNS, connection reset,
@@ -583,15 +644,15 @@ export class CallPool {
         const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
         let delay = this.retryDelay;
 
-        // Retry waits happen INSIDE the limiter slot: a retrying request keeps
-        // occupying its concurrency slot, which acts as natural backpressure.
+        // Retry waits happen INSIDE the scheduler slot: a retrying logical job
+        // keeps occupying its concurrency slot, which acts as natural backpressure.
         for (let attempt = 1; ; attempt++) {
             if (signal?.aborted) throw signal.reason ?? new Error("Request aborted");
 
             try {
                 return await this.executeOnce<T>(path, reqOpts);
             } catch (err) {
-                const retryable = err instanceof CallPoolError ? err.retryable : true;
+                const retryable = this.isRetryableError(err);
                 if (!retryable || signal?.aborted || attempt >= this.maxAttempts) throw err;
 
                 // A 429 carries its own (capped) Retry-After wait, honored
@@ -603,8 +664,15 @@ export class CallPool {
         }
     }
 
+    private isRetryableError(err: unknown): boolean {
+        if (err instanceof CallPoolError) return err.retryable;
+        if (err instanceof PoolClosedError) return false;
+        if (err instanceof errors.InvalidArgumentError || err instanceof errors.InvalidReturnValueError) return false;
+        if (err instanceof errors.RequestAbortedError) return false;
+        return true;
+    }
+
     private async executeOnce<T>(path: string, reqOpts: Omit<RequestOptions, "priority">): Promise<T> {
-        const start = performance.now();
         const { body: requestBody, headers: requestHeaders, method = "GET", ...dispatcherOptions } = reqOpts;
         let body = requestBody;
         const headers = { ...this.defaultHeaders, ...requestHeaders } as Record<string, string>;
@@ -614,6 +682,8 @@ export class CallPool {
             if (!this.hasHeader(headers, "content-type")) headers["Content-Type"] = "application/json";
         }
 
+        if (this.rateGate) await this.rateGate.acquire();
+        const start = performance.now();
         const response = await this.client.request({
             ...dispatcherOptions,
             path,
@@ -628,21 +698,24 @@ export class CallPool {
         let measuredDuration = 0;
         if (this.useTTFB) measuredDuration = performance.now() - start;
 
-        // Download
-        const rawBody = await response.body.text();
+        const statusCode = response.statusCode;
+        const resHeaders = this.sanitizeHeaders(response.headers);
+        const contentType = this.getHeaderValue(resHeaders["content-type"]);
+        const isBinaryResponse = statusCode < 400 && contentType !== undefined && !contentType.includes("application/json") && !this.isTextContentType(contentType);
+
+        // Preserve bytes only for successful binary media. Text, JSON and error
+        // bodies keep their established string representation.
+        const rawBody = isBinaryResponse ? Buffer.from(await response.body.arrayBuffer()) : await response.body.text();
 
         // Measure Total (Fallback)
         if (!this.useTTFB) measuredDuration = performance.now() - start;
-
-        const statusCode = response.statusCode;
-        const resHeaders = this.sanitizeHeaders(response.headers);
 
         // Adaptive Logic Hook
         if (this.adaptiveEnabled && measuredDuration > 0 && statusCode < 400) {
             this.updateThrottleLogic(measuredDuration);
         }
 
-        this.assertSuccess(statusCode, rawBody, resHeaders);
+        this.assertSuccess(statusCode, typeof rawBody === "string" ? rawBody : rawBody.toString("utf8"), resHeaders);
         return this.parseBody<T>(statusCode, rawBody, resHeaders);
     }
 
@@ -682,17 +755,32 @@ export class CallPool {
         }
     }
 
-    private parseBody<T>(statusCode: number, rawBody: string, resHeaders: Record<string, string | string[] | undefined>): T {
+    private parseBody<T>(statusCode: number, rawBody: string | Buffer, resHeaders: Record<string, string | string[] | undefined>): T {
         const contentType = this.getHeaderValue(resHeaders["content-type"]);
         if (contentType && contentType.includes("application/json")) {
+            const textBody = typeof rawBody === "string" ? rawBody : rawBody.toString("utf8");
             try {
-                return JSON.parse(rawBody) as T;
+                return JSON.parse(textBody) as T;
             } catch {
-                throw new CallPoolError("Invalid JSON response", { statusCode, body: rawBody, headers: resHeaders, retryable: false });
+                throw new CallPoolError("Invalid JSON response", { statusCode, body: textBody, headers: resHeaders, retryable: false });
             }
         }
 
         return rawBody as unknown as T;
+    }
+
+    private isTextContentType(contentType: string): boolean {
+        const mediaType = contentType.split(";", 1)[0].trim().toLowerCase();
+        return (
+            mediaType.startsWith("text/") ||
+            mediaType.endsWith("+json") ||
+            mediaType.endsWith("+xml") ||
+            mediaType === "application/xml" ||
+            mediaType === "application/javascript" ||
+            mediaType === "application/x-javascript" ||
+            mediaType === "application/x-www-form-urlencoded" ||
+            mediaType === "image/svg+xml"
+        );
     }
 
     private hasHeader(headers: Record<string, string>, name: string) {
@@ -861,6 +949,7 @@ export class CallPool {
             clearTimeout(this.pendingUpdateTimer);
             this.pendingUpdateTimer = null;
         }
+        this.rateGate?.stop();
         await this.scheduler.stop();
         await this.client.close();
     }
