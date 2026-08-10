@@ -57,7 +57,7 @@ describe("Adaptive Throttling - Full Validation", () => {
 
             const baseUrl = await mockServer.start({
                 latency: () => {
-                    if (mockServer.getRequestCount() === 1) return 100; // Baseline
+                    if (mockServer.getRequestCount() === 1) return 180; // Baseline (>= ignoreBelow, so it can seed the average)
                     if (mockServer.getRequestCount() === 2) return 3000; // Spike
                     return 100; // Torna veloce
                 },
@@ -84,7 +84,7 @@ describe("Adaptive Throttling - Full Validation", () => {
                 expect(pool.getCurrentConcurrency()).toBe(10);
 
                 // --- FASE 2: SPIKE ---
-                // 3000ms > (avgLatency ~100ms * 1.5). Attiva reduceConcurrency
+                // 3000ms > (avgLatency ~180ms * 1.5). Attiva reduceConcurrency
                 // min(10*0.9, 10-1) = min(9, 9) = 9
                 await pool.request("/spike");
                 expect(pool.getCurrentConcurrency()).toBe(9);
@@ -113,6 +113,63 @@ describe("Adaptive Throttling - Full Validation", () => {
                 await Promise.all([pool.close(), mockServer.stop()]);
             }
         }, 30000);
+    });
+
+    describe("Slow Start", () => {
+        it("should honor adaptive.initialConcurrency and ramp up on fast responses", async () => {
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({ latency: 20 }); // below ignoreBelow -> headroom signal
+
+            const pool = new CallPool({
+                baseUrl,
+                concurrency: { limit: 10 },
+                adaptive: { enabled: true, initialConcurrency: 2 },
+            });
+
+            try {
+                expect(pool.getCurrentConcurrency()).toBe(2);
+
+                // Each fast response adds increaseStep (default 1)
+                await pool.request("/fast-1");
+                await pool.request("/fast-2");
+                await pool.request("/fast-3");
+
+                expect(pool.getCurrentConcurrency()).toBe(5);
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        }, 15000);
+    });
+
+    describe("Baseline Bootstrap", () => {
+        it("should not let a fast first response poison the congestion baseline", async () => {
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({
+                // First response is a cache hit far below ignoreBelow (default 100ms)
+                latency: () => (mockServer.getRequestCount() === 1 ? 20 : 180),
+            });
+
+            const pool = new CallPool({
+                baseUrl,
+                concurrency: { limit: 10 },
+                adaptive: { enabled: true, congestionRatio: 2, breachLimit: 1 },
+            });
+
+            try {
+                // Must NOT seed the baseline: with avgLatency ~20ms every real
+                // request (~180ms > 40ms threshold) would count as congestion.
+                await pool.request("/cache-hit");
+
+                // Real traffic seeds the baseline (~180ms) and stays neutral.
+                await pool.request("/real-1");
+                await pool.request("/real-2");
+                await pool.request("/real-3");
+
+                expect(pool.getCurrentConcurrency()).toBe(10);
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        }, 15000);
     });
 
     describe("Safety Caps (Min/Max)", () => {

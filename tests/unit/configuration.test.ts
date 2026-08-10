@@ -59,6 +59,20 @@ describe.concurrent("Configuration Enforcement", () => {
             expect(() => new CallPool({ baseUrl: "http://localhost", retry: { maxAttempts: 0 } })).toThrow(/retry\.maxAttempts/);
             expect(() => new CallPool({ baseUrl: "http://localhost", network: { timeout: 0 } })).toThrow(/network\.timeout/);
             expect(() => new CallPool({ baseUrl: "http://localhost", adaptive: { decreaseFactor: 1 } })).toThrow(/adaptive\.decreaseFactor/);
+            expect(() => new CallPool({ baseUrl: "http://localhost", retry: { maxRetryAfter: -1 } })).toThrow(/retry\.maxRetryAfter/);
+            expect(() => new CallPool({ baseUrl: "http://localhost", concurrency: { limit: 5 }, adaptive: { initialConcurrency: 6 } })).toThrow(
+                /adaptive\.initialConcurrency/
+            );
+            expect(() => new CallPool({ baseUrl: "http://localhost", adaptive: { minConcurrency: 1, initialConcurrency: 0 } })).toThrow(
+                /adaptive\.initialConcurrency/
+            );
+        });
+
+        it("should make close() idempotent and concurrent-safe", async () => {
+            const pool = new CallPool({ baseUrl: "http://localhost:59998" });
+            // Concurrent calls must await the same teardown, not resolve early
+            await Promise.all([pool.close(), pool.close()]);
+            await expect(pool.close()).resolves.toBeUndefined();
         });
     });
 
