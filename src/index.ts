@@ -93,7 +93,50 @@ export interface CallPoolOptions {
     network?: {
         timeout?: number;
         defaultHeaders?: Record<string, string>;
+        /**
+         * TLS settings for this pool's connections. Scoped to this pool only:
+         * the process-wide trust store is never touched, so every other
+         * connection in the process keeps validating against the system CAs.
+         */
+        tls?: CallPoolTlsOptions;
     };
+}
+
+/**
+ * TLS settings applied to the pool's connections.
+ *
+ * Certificates and keys are passed as PEM **content**, not as file paths:
+ * read them yourself (e.g. `readFileSync(path, "utf8")`) so the caller stays
+ * in control of how they are loaded.
+ */
+export interface CallPoolTlsOptions {
+    /**
+     * Additional CA certificate(s) trusted by this pool, in PEM format.
+     * Replaces the default CA bundle for these connections, so include every
+     * certificate needed to complete the chain.
+     */
+    ca?: string | Buffer | Array<string | Buffer>;
+
+    /** Client certificate (PEM) for mutual TLS. Requires `key`. */
+    cert?: string | Buffer;
+
+    /** Private key (PEM) for mutual TLS. Requires `cert`. */
+    key?: string | Buffer;
+
+    /** Passphrase decrypting an encrypted `key` */
+    passphrase?: string;
+
+    /** SNI hostname, when it differs from the host in `baseUrl` */
+    servername?: string;
+
+    /**
+     * Whether the server certificate must validate. Default: `true`.
+     * Setting this to `false` disables certificate verification entirely and
+     * exposes the connection to interception: use it only against a local or
+     * disposable environment, never to work around a chain that a proper `ca`
+     * would fix.
+     */
+    rejectUnauthorized?: boolean;
 }
 
 export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin" | "path" | "method" | "body" | "headers" | "signal"> {
@@ -492,7 +535,7 @@ export class CallPool {
         this.currentConcurrency = this.adaptiveEnabled ? (adaptOpts?.initialConcurrency ?? this.maxConcurrency) : this.maxConcurrency;
 
         // --- 4. SETUP UNDICI & SCHEDULER ---
-        this.client = this.createClient(options.baseUrl, concurrencyLimit);
+        this.client = this.createClient(options.baseUrl, concurrencyLimit, options.network?.tls);
         this.scheduler = new RequestScheduler({ maxConcurrent: this.currentConcurrency });
         const minTime = this.computeBaseMinTime(rateOpts);
         this.rateGate = minTime > 0 || rateOpts?.quota ? new RateGate({ minTime, quota: rateOpts?.quota }) : null;
@@ -504,12 +547,16 @@ export class CallPool {
         return Math.ceil(rateOpts.quota.window / rateOpts.quota.max);
     }
 
-    private createClient(baseUrl: string, connections: number): Pool {
+    private createClient(baseUrl: string, connections: number, tls?: CallPoolTlsOptions): Pool {
         // Undici Pool needs the HARD limit (total sockets available)
         return new Pool(baseUrl, {
             connections,
             pipelining: 1,
             keepAliveTimeout: 10_000,
+            // Spread instead of `connect: undefined`: undici skips its default
+            // connector when the key is present, so pools without TLS options
+            // must not carry the key at all.
+            ...(tls ? { connect: { ...tls } } : {}),
         });
     }
 
@@ -534,9 +581,57 @@ export class CallPool {
             throw new Error("[CallPool] 'network.timeout' must be a positive number");
         }
 
+        this.validateTlsOptions(options.network?.tls);
         this.validateRateLimitOptions(options.rateLimit);
         this.validateRetryOptions(options.retry);
         this.validateAdaptiveOptions(options.adaptive, concurrencyLimit);
+    }
+
+    private validateTlsOptions(tls: CallPoolTlsOptions | undefined) {
+        if (tls === undefined) return;
+        if (typeof tls !== "object" || tls === null || Array.isArray(tls)) {
+            throw new Error("[CallPool] 'network.tls' must be an object");
+        }
+
+        const cas = tls.ca === undefined ? [] : Array.isArray(tls.ca) ? tls.ca : [tls.ca];
+        if (Array.isArray(tls.ca) && tls.ca.length === 0) {
+            throw new Error("[CallPool] 'network.tls.ca' must not be an empty array");
+        }
+        cas.forEach((ca, i) => this.validatePem(ca, Array.isArray(tls.ca) ? `network.tls.ca[${i}]` : "network.tls.ca"));
+
+        if (tls.cert !== undefined) this.validatePem(tls.cert, "network.tls.cert");
+        if (tls.key !== undefined) this.validatePem(tls.key, "network.tls.key");
+        if ((tls.cert === undefined) !== (tls.key === undefined)) {
+            throw new Error("[CallPool] 'network.tls.cert' and 'network.tls.key' must be provided together");
+        }
+
+        if (tls.passphrase !== undefined && typeof tls.passphrase !== "string") {
+            throw new Error("[CallPool] 'network.tls.passphrase' must be a string");
+        }
+        if (tls.servername !== undefined && (typeof tls.servername !== "string" || tls.servername.length === 0)) {
+            throw new Error("[CallPool] 'network.tls.servername' must be a non-empty string");
+        }
+        if (tls.rejectUnauthorized !== undefined && typeof tls.rejectUnauthorized !== "boolean") {
+            throw new Error("[CallPool] 'network.tls.rejectUnauthorized' must be a boolean");
+        }
+    }
+
+    /**
+     * Guards the most common mistake: passing a file path instead of the PEM
+     * content. Node would silently ignore the unparsable value and fail later
+     * with an opaque handshake error.
+     */
+    private validatePem(value: string | Buffer, field: string) {
+        if (Buffer.isBuffer(value)) {
+            if (value.length === 0) throw new Error(`[CallPool] '${field}' must not be empty`);
+            return;
+        }
+        if (typeof value !== "string" || value.trim().length === 0) {
+            throw new Error(`[CallPool] '${field}' must be a non-empty string or Buffer`);
+        }
+        if (!value.includes("-----BEGIN")) {
+            throw new Error(`[CallPool] '${field}' must be PEM content, not a file path`);
+        }
     }
 
     private validateRateLimitOptions(rateLimit: CallPoolOptions["rateLimit"]) {

@@ -18,6 +18,7 @@ The tool uses a **Real-Time Adaptive Throttling** feature (based on the **EMA al
 -   **Rate Limiting**: In-process priority scheduler with precise quota management, supporting both fixed windows and "auto" distribution
 -   **Adaptive Throttling**: Real-time latency monitoring. It automatically slows down when the upstream service starts to lag, preventing 429s and timeouts
 -   **Automatic Retry**: Built-in exponential backoff for network and server errors, with `Retry-After` header and `AbortSignal` support
+-   **Per-Pool TLS**: Trust a private CA or present a client certificate on a single pool, without widening the trust store of the whole process
 
 ## Installation
 
@@ -194,6 +195,48 @@ await pool.close();
 | ------------------------ | ------------------------ | -------- | ------- | ----------------------------------- |
 | `network.timeout`        | `number`                 | No       | `30000` | Header and body inactivity timeout for a single request in ms |
 | `network.defaultHeaders` | `Record<string, string>` | No       | `{}`    | Headers to include in every request |
+| `network.tls`            | `object`                 | No       | -       | TLS settings for this pool's connections (see below) |
+
+#### TLS
+
+Certificates and keys are passed as PEM **content**, never as file paths: read them yourself so your application stays in control of how they are loaded. Passing a path throws at construction time.
+
+| Option                            | Type                                       | Required | Default | Description                                                         |
+| --------------------------------- | ------------------------------------------ | -------- | ------- | ------------------------------------------------------------------- |
+| `network.tls.ca`                  | `string \| Buffer \| Array<string\|Buffer>` | No       | -       | Additional CA certificate(s) trusted by this pool                    |
+| `network.tls.cert`                | `string \| Buffer`                          | No       | -       | Client certificate for mutual TLS (requires `key`)                   |
+| `network.tls.key`                 | `string \| Buffer`                          | No       | -       | Private key for mutual TLS (requires `cert`)                         |
+| `network.tls.passphrase`          | `string`                                   | No       | -       | Passphrase decrypting an encrypted `key`                             |
+| `network.tls.servername`          | `string`                                   | No       | -       | SNI hostname, when it differs from the host in `baseUrl`             |
+| `network.tls.rejectUnauthorized`  | `boolean`                                  | No       | `true`  | Whether the server certificate must validate                         |
+
+These settings apply **only to this pool**. The process-wide trust store is untouched, so every other connection your application makes keeps validating against the system CAs — unlike `NODE_EXTRA_CA_CERTS`, which widens trust for the whole process.
+
+```ts
+import { readFileSync } from "node:fs";
+
+// An endpoint whose chain the system CA bundle cannot complete
+const pool = new CallPool({
+    baseUrl: "https://api.internal.example.com",
+    network: {
+        tls: { ca: readFileSync("./certs/internal-ca.pem", "utf8") },
+    },
+});
+
+// Mutual TLS
+const mtlsPool = new CallPool({
+    baseUrl: "https://api.partner.example.com",
+    network: {
+        tls: {
+            cert: readFileSync("./certs/client.crt", "utf8"),
+            key: readFileSync("./certs/client.key", "utf8"),
+            passphrase: process.env.CLIENT_KEY_PASSPHRASE,
+        },
+    },
+});
+```
+
+> `rejectUnauthorized: false` disables certificate verification entirely and exposes the connection to interception. Use it only against a local or disposable environment, never to work around a chain that a proper `ca` would fix.
 
 ## Request
 
