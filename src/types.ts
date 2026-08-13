@@ -135,7 +135,12 @@ export interface CallPoolTlsOptions {
     rejectUnauthorized?: boolean;
 }
 
-export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin" | "path" | "method" | "body" | "headers" | "signal"> {
+/**
+ * `throwOnError` is excluded from the undici passthrough: undici would reject
+ * with its own ResponseStatusCodeError before the pool's error/retry policy
+ * runs, silently retrying non-retryable 4xx responses.
+ */
+export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin" | "path" | "method" | "body" | "headers" | "signal" | "throwOnError"> {
     method?: Dispatcher.HttpMethod;
     priority?: number;
     body?: string | Buffer | Uint8Array | object | null;
@@ -145,6 +150,32 @@ export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin"
      * shape, but the retry loop's abort guards would not see it).
      */
     signal?: AbortSignal | null;
+
+    /**
+     * Shape of the resolved value. `"body"` (default) resolves with the parsed
+     * body alone; `"raw"` resolves with a {@link CallPoolResponse} envelope
+     * carrying status and headers as well. Error and retry semantics are
+     * identical in both modes: 4xx/5xx still reject with CallPoolError.
+     */
+    response?: "body" | "raw";
+
+    /**
+     * Opt-in for reading Set-Cookie in a `"raw"` envelope. By default the
+     * header is redacted everywhere so cookies can't leak through logged
+     * responses; enabling this exposes it in the envelope of THIS request
+     * only. Headers attached to CallPoolError stay redacted regardless.
+     */
+    exposeCookies?: boolean;
+}
+
+/** Resolved value of a request issued with `response: "raw"`. */
+export interface CallPoolResponse<T = unknown> {
+    /** HTTP status code of the final response */
+    status: number;
+    /** Response headers (Set-Cookie is redacted unless `exposeCookies` is set) */
+    headers: Record<string, string | string[] | undefined>;
+    /** Body, parsed with the same rules as the default mode (JSON/text/Buffer) */
+    body: T;
 }
 
 /** Live snapshot of the pool's scheduling state; see {@link CallPool.getStats}. */

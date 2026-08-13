@@ -316,12 +316,40 @@ const newUser = await pool.request<User>("/users", {
 
 ### Options
 
-| Option     | Type                                               | Required | Default | Description                                                    |
-| ---------- | -------------------------------------------------- | -------- | ------- | -------------------------------------------------------------- |
-| `method`   | `HttpMethod`                                       | No       | `"GET"` | HTTP method (GET, POST, PUT, DELETE, etc.)                     |
-| `priority` | `number`                                           | No       | `5`     | Queue priority (0-9, lower numbers run first; 0 is highest)    |
-| `body`     | `string \| Buffer \| Uint8Array \| object \| null` | No       | -       | Request body (JS objects are automatically serialized to JSON) |
-| `headers`  | `Record<string, string>`                           | No       | -       | Additional headers for the single request                      |
+| Option          | Type                                               | Required | Default  | Description                                                     |
+| --------------- | -------------------------------------------------- | -------- | -------- | --------------------------------------------------------------- |
+| `method`        | `HttpMethod`                                       | No       | `"GET"`  | HTTP method (GET, POST, PUT, DELETE, etc.)                      |
+| `priority`      | `number`                                           | No       | `5`      | Queue priority (0-9, lower numbers run first; 0 is highest)     |
+| `body`          | `string \| Buffer \| Uint8Array \| object \| null` | No       | -        | Request body (JS objects are automatically serialized to JSON)  |
+| `headers`       | `Record<string, string>`                           | No       | -        | Additional headers for the single request                       |
+| `response`      | `"body" \| "raw"`                                  | No       | `"body"` | `"raw"` resolves with a `{ status, headers, body }` envelope    |
+| `exposeCookies` | `boolean`                                          | No       | `false`  | Reveals `Set-Cookie` in the raw envelope (redacted by default)  |
+
+Every other [undici `RequestOptions`](https://github.com/nodejs/undici/blob/main/docs/docs/api/Dispatcher.md#parameter-requestoptions) field (`query`, `maxRedirections`, `idempotent`, `headersTimeout`, ...) is passed through 1:1, except `throwOnError`, which is excluded because it would bypass the pool's error and retry policy.
+
+### Raw Responses
+
+By default `request()` resolves with the parsed body alone. With `response: "raw"` it resolves with the full envelope — same parsing rules, same error/retry semantics (4xx/5xx still reject with `CallPoolError`):
+
+```typescript
+const res = await pool.request<LoginPage>("/login", { response: "raw" });
+// res: { status: number, headers: Record<string, ...>, body: LoginPage }
+
+// 3xx responses do not throw and redirects are not followed by default,
+// so raw mode lets you walk a redirect chain manually:
+if (res.status === 302) {
+    const next = res.headers["location"];
+}
+```
+
+`Set-Cookie` is redacted everywhere by default so session cookies can't leak through logged responses or errors. When the cookie **is** the data (e.g. session bootstrap), opt in per request:
+
+```typescript
+const res = await pool.request("/auth", { response: "raw", exposeCookies: true });
+const cookies = res.headers["set-cookie"]; // real value(s)
+```
+
+Headers attached to `CallPoolError` stay redacted even with `exposeCookies: true`.
 
 ## Adaptive Throttling
 

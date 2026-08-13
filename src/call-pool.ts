@@ -1,10 +1,13 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { Pool, errors } from "undici";
-import { CallPoolOptions, CallPoolStats, CallPoolTlsOptions, RequestOptions } from "./types.js";
+import { CallPoolOptions, CallPoolResponse, CallPoolStats, CallPoolTlsOptions, RequestOptions } from "./types.js";
 import { CallPoolError, PoolClosedError } from "./errors.js";
 import { RateGate } from "./rate-gate.js";
 import { RequestScheduler } from "./scheduler.js";
 import { validateOptions } from "./validation.js";
+
+/** Per-request options left after the pool-level keys are extracted. */
+type TransportOptions = Omit<RequestOptions, "priority" | "response" | "exposeCookies">;
 
 export class CallPool {
     private client: Pool;
@@ -129,19 +132,24 @@ export class CallPool {
      * @param path - Request path, appended to `baseUrl`.
      * @param options - Per-request overrides. `signal` aborts the request, including
      * any pending retry wait. `priority` (0-9, default 5) sets scheduling order in
-     * the limiter's queue; lower values run first.
+     * the limiter's queue; lower values run first. `response: "raw"` resolves with a
+     * `{ status, headers, body }` envelope instead of the bare body, with the same
+     * error/retry semantics; `exposeCookies` additionally reveals Set-Cookie there.
      * @throws {CallPoolError} On a non-retryable HTTP failure, or after retries are exhausted.
      * @throws {Error} If `priority` is not an integer between 0 and 9.
      */
-    public async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T> {
-        const { priority = 5, ...reqOpts } = options;
+    public async request<T = unknown>(path: string, options?: RequestOptions & { response?: "body" }): Promise<T>;
+    public async request<T = unknown>(path: string, options: RequestOptions & { response: "raw" }): Promise<CallPoolResponse<T>>;
+    public async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T | CallPoolResponse<T>> {
+        const { priority = 5, response = "body", exposeCookies = false, ...reqOpts } = options;
         if (!Number.isInteger(priority) || priority < 0 || priority > 9) {
             throw new Error("[CallPool] 'priority' must be an integer between 0 and 9");
         }
-        return this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, reqOpts));
+        const envelope = await this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, reqOpts, exposeCookies));
+        return response === "raw" ? envelope : envelope.body;
     }
 
-    private async executeWithRetry<T>(path: string, reqOpts: Omit<RequestOptions, "priority">): Promise<T> {
+    private async executeWithRetry<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean): Promise<CallPoolResponse<T>> {
         const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
         let delay = this.retryDelay;
 
@@ -151,7 +159,7 @@ export class CallPool {
             if (signal?.aborted) throw signal.reason ?? new Error("Request aborted");
 
             try {
-                return await this.executeOnce<T>(path, reqOpts);
+                return await this.executeOnce<T>(path, reqOpts, exposeCookies);
             } catch (err) {
                 const retryable = this.isRetryableError(err);
                 if (!retryable || signal?.aborted || attempt >= this.maxAttempts) throw err;
@@ -175,8 +183,10 @@ export class CallPool {
         return true;
     }
 
-    private async executeOnce<T>(path: string, reqOpts: Omit<RequestOptions, "priority">): Promise<T> {
+    private async executeOnce<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean): Promise<CallPoolResponse<T>> {
         const { body: requestBody, headers: requestHeaders, method = "GET", ...dispatcherOptions } = reqOpts;
+        // The type-level Omit doesn't stop plain-JS callers: drop the key for real.
+        delete (dispatcherOptions as { throwOnError?: boolean }).throwOnError;
         let body = requestBody;
         const headers = { ...this.defaultHeaders, ...requestHeaders } as Record<string, string>;
 
@@ -217,7 +227,14 @@ export class CallPool {
         // A Buffer rawBody implies isBinaryResponse, hence statusCode < 400:
         // assertSuccess never reads the body there, so skip the utf8 decode.
         this.assertSuccess(statusCode, typeof rawBody === "string" ? rawBody : "", resHeaders);
-        return this.parseBody<T>(statusCode, rawBody, resHeaders);
+
+        // Errors above always carry the sanitized copy; the opt-in only
+        // uncovers Set-Cookie in the success envelope the caller asked for.
+        return {
+            status: statusCode,
+            headers: exposeCookies ? { ...response.headers } : resHeaders,
+            body: this.parseBody<T>(statusCode, rawBody, resHeaders),
+        };
     }
 
     private sanitizeHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string | string[] | undefined> {
