@@ -93,8 +93,20 @@ export interface CallPoolOptions {
          * TLS settings for this pool's connections. Scoped to this pool only:
          * the process-wide trust store is never touched, so every other
          * connection in the process keeps validating against the system CAs.
+         * With `proxy` set these options apply to the tunneled connection to
+         * `baseUrl`, not to the proxy hop.
          */
         tls?: CallPoolTlsOptions;
+        /**
+         * HTTP(S) forward proxy for this pool, as a URL with optional embedded
+         * credentials (`http://user:pass@host:port`). When set, every request
+         * reaches `baseUrl` through a CONNECT tunnel opened on the proxy;
+         * credentials are sent as Proxy-Authorization (Basic). Status codes,
+         * headers and latency observed by the pool remain those of the target,
+         * so retry, Retry-After and adaptive throttling behave as without a
+         * proxy. Scoped to this pool only.
+         */
+        proxy?: string;
     };
 }
 

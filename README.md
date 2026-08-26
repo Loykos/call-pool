@@ -196,6 +196,27 @@ await pool.close();
 | `network.timeout`        | `number`                 | No       | `30000` | Header and body inactivity timeout for a single request in ms |
 | `network.defaultHeaders` | `Record<string, string>` | No       | `{}`    | Headers to include in every request |
 | `network.tls`            | `object`                 | No       | -       | TLS settings for this pool's connections (see below) |
+| `network.proxy`          | `string`                 | No       | -       | HTTP(S) forward proxy URL for this pool (see below) |
+
+#### Proxy
+
+When `network.proxy` is set, every request reaches `baseUrl` through a CONNECT tunnel opened on the proxy. Credentials embedded in the URL are extracted and sent as `Proxy-Authorization` (Basic).
+
+```ts
+const pool = new CallPool({
+    baseUrl: "https://api.example.com",
+    network: {
+        proxy: "http://user:pass@proxy.example.com:3128",
+    },
+});
+
+// Requests are unchanged: same paths, same options, same responses
+const data = await pool.request("/resource");
+```
+
+The tunnel is transparent to every pool feature: status codes, headers and latency observed by the pool are those of the **target**, so retry, `Retry-After` handling and adaptive throttling behave exactly as without a proxy. TLS stays end-to-end with the target (the proxy only relays encrypted bytes); `network.tls` options apply to the tunneled connection, not to the proxy hop.
+
+Scoped to this pool only: pools without `network.proxy` keep connecting directly. Only `http:`/`https:` proxy URLs are supported (no SOCKS).
 
 #### TLS
 

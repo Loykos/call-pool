@@ -21,10 +21,28 @@ export function validateOptions(options: CallPoolOptions): void {
         throw new Error("[CallPool] 'network.timeout' must be a positive number");
     }
 
+    validateProxyOption(options.network?.proxy);
     validateTlsOptions(options.network?.tls);
     validateRateLimitOptions(options.rateLimit);
     validateRetryOptions(options.retry);
     validateAdaptiveOptions(options.adaptive, concurrencyLimit);
+}
+
+function validateProxyOption(proxy: string | undefined): void {
+    if (proxy === undefined) return;
+    if (typeof proxy !== "string" || proxy.length === 0) {
+        throw new Error("[CallPool] 'network.proxy' must be a non-empty string");
+    }
+
+    let url: URL;
+    try {
+        url = new URL(proxy);
+    } catch {
+        throw new Error("[CallPool] 'network.proxy' must be a valid URL");
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+        throw new Error("[CallPool] 'network.proxy' must use the http or https protocol");
+    }
 }
 
 function validateTlsOptions(tls: CallPoolTlsOptions | undefined): void {

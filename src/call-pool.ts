@@ -1,5 +1,5 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import { Pool, errors } from "undici";
+import { Pool, ProxyAgent, errors } from "undici";
 import { CallPoolOptions, CallPoolResponse, CallPoolStats, CallPoolTlsOptions, RequestOptions } from "./types.js";
 import { CallPoolError, PoolClosedError } from "./errors.js";
 import { RateGate } from "./rate-gate.js";
@@ -10,7 +10,9 @@ import { validateOptions } from "./validation.js";
 type TransportOptions = Omit<RequestOptions, "priority" | "response" | "exposeCookies">;
 
 export class CallPool {
-    private client: Pool;
+    private client: Pool | ProxyAgent;
+    /** Set only when proxied: ProxyAgent needs the target origin on every request. */
+    private proxiedOrigin: string | null = null;
     private scheduler: RequestScheduler;
     private rateGate: RateGate | null;
 
@@ -92,7 +94,7 @@ export class CallPool {
         this.currentConcurrency = this.adaptiveEnabled ? (adaptOpts?.initialConcurrency ?? this.maxConcurrency) : this.maxConcurrency;
 
         // --- 4. SETUP UNDICI & SCHEDULER ---
-        this.client = this.createClient(options.baseUrl, concurrencyLimit, options.network?.tls);
+        this.client = this.createClient(options.baseUrl, concurrencyLimit, options.network?.tls, options.network?.proxy);
         this.scheduler = new RequestScheduler({ maxConcurrent: this.currentConcurrency });
         const minTime = this.computeBaseMinTime(rateOpts);
         this.rateGate = minTime > 0 || rateOpts?.quota ? new RateGate({ minTime, quota: rateOpts?.quota }) : null;
@@ -104,7 +106,27 @@ export class CallPool {
         return Math.ceil(rateOpts.quota.window / rateOpts.quota.max);
     }
 
-    private createClient(baseUrl: string, connections: number, tls?: CallPoolTlsOptions): Pool {
+    private createClient(baseUrl: string, connections: number, tls?: CallPoolTlsOptions, proxy?: string): Pool | ProxyAgent {
+        if (proxy) {
+            this.proxiedOrigin = new URL(baseUrl).origin;
+            const proxyUrl = new URL(proxy);
+            // Credentials travel as Proxy-Authorization, not embedded in the
+            // uri: undici only reads them reliably from `token`.
+            const token = proxyUrl.username
+                ? `Basic ${Buffer.from(`${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`).toString("base64")}`
+                : undefined;
+            return new ProxyAgent({
+                uri: proxyUrl.origin,
+                ...(token ? { token } : {}),
+                connections,
+                pipelining: 1,
+                keepAliveTimeout: 10_000,
+                // TLS options apply to the tunneled connection to the target,
+                // not to the hop toward the proxy.
+                ...(tls ? { requestTls: { ...tls } } : {}),
+            });
+        }
+
         // Undici Pool needs the HARD limit (total sockets available)
         return new Pool(baseUrl, {
             connections,
@@ -199,6 +221,9 @@ export class CallPool {
         const start = performance.now();
         const response = await this.client.request({
             ...dispatcherOptions,
+            // A Pool is bound to its origin; a ProxyAgent is origin-agnostic
+            // and must be told the tunnel target on every request.
+            ...(this.proxiedOrigin ? { origin: this.proxiedOrigin } : {}),
             path,
             method,
             headers,

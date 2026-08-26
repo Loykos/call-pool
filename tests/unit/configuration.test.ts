@@ -68,6 +68,18 @@ describe.concurrent("Configuration Enforcement", () => {
             );
         });
 
+        it("should fail early on invalid proxy configuration", () => {
+            expect(() => new CallPool({ baseUrl: "http://localhost", network: { proxy: "" } })).toThrow(/network\.proxy/);
+            expect(() => new CallPool({ baseUrl: "http://localhost", network: { proxy: "not a url" } })).toThrow(/network\.proxy/);
+            expect(() => new CallPool({ baseUrl: "http://localhost", network: { proxy: "socks5://127.0.0.1:1080" } })).toThrow(/network\.proxy/);
+        });
+
+        it("should accept a valid proxy URL, with or without credentials", async () => {
+            const bare = new CallPool({ baseUrl: "http://localhost", network: { proxy: "http://127.0.0.1:3128" } });
+            const authed = new CallPool({ baseUrl: "http://localhost", network: { proxy: "http://user:pass@127.0.0.1:3128" } });
+            await Promise.all([bare.close(), authed.close()]);
+        });
+
         it("should make close() idempotent and concurrent-safe", async () => {
             const pool = new CallPool({ baseUrl: "http://localhost:59998" });
             // Concurrent calls must await the same teardown, not resolve early
