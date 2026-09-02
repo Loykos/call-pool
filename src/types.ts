@@ -172,6 +172,22 @@ export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin"
     response?: "body" | "raw";
 
     /**
+     * Reads the response body as bytes whatever the server says it is.
+     *
+     * By default the shape is inferred from `Content-Type`, which leaves a
+     * server that omits the header — or labels a picture as text — indistinct
+     * from a textual response: the body is decoded as UTF-8 and the original
+     * bytes are gone for good. A caller fetching an image, a PDF or any other
+     * file knows better than the header does, and this flag says so. It also
+     * suppresses the automatic JSON parsing, so `application/json` served to a
+     * binary request resolves as a Buffer too.
+     *
+     * Error bodies (4xx/5xx) stay textual regardless: the message a failure
+     * carries is meant to be read.
+     */
+    binary?: boolean;
+
+    /**
      * Opt-in for reading Set-Cookie in a `"raw"` envelope. By default the
      * header is redacted everywhere so cookies can't leak through logged
      * responses; enabling this exposes it in the envelope of THIS request

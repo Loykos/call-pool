@@ -111,6 +111,105 @@ describe.concurrent("Parsing Logic", () => {
         });
     });
 
+    describe("Binary Opt-In", () => {
+        const payload = Buffer.from([0x00, 0xff, 0x80, 0xc3, 0x28, 0x41]);
+
+        it("should preserve bytes when the response carries no Content-Type", async () => {
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({ headers: {}, body: payload });
+            const pool = new CallPool({ baseUrl });
+
+            try {
+                const result = await pool.request<Buffer>("/no-content-type", { binary: true });
+                expect(Buffer.isBuffer(result)).toBe(true);
+                expect(result.toString("hex")).toBe("00ff80c32841");
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
+        it("should keep decoding a Content-Type-less response as text by default", async () => {
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({ headers: {}, body: "plain" });
+            const pool = new CallPool({ baseUrl });
+
+            try {
+                expect(await pool.request("/default")).toBe("plain");
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
+        it("should preserve bytes a textual Content-Type would have decoded", async () => {
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({
+                headers: { "Content-Type": "text/html" },
+                body: payload,
+            });
+            const pool = new CallPool({ baseUrl });
+
+            try {
+                const result = await pool.request<Buffer>("/mislabelled", { binary: true });
+                expect(result.toString("hex")).toBe("00ff80c32841");
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
+        it("should not parse JSON when the caller asked for bytes", async () => {
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({
+                headers: { "Content-Type": "application/json" },
+                body: { status: "ok" },
+            });
+            const pool = new CallPool({ baseUrl });
+
+            try {
+                const result = await pool.request<Buffer>("/json-as-bytes", { binary: true });
+                expect(Buffer.isBuffer(result)).toBe(true);
+                expect(JSON.parse(result.toString("utf8"))).toEqual({ status: "ok" });
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
+        it("should keep an error body readable", async () => {
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({
+                statusCode: 404,
+                headers: {},
+                body: "not found here",
+            });
+            const pool = new CallPool({ baseUrl });
+
+            try {
+                await expect(pool.request("/missing", { binary: true })).rejects.toThrow("not found here");
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
+        it("should not forward the flag to the transport as a request option", async () => {
+            const mockServer = new MockServer();
+            let seen: Record<string, string> = {};
+            const baseUrl = await mockServer.start({
+                headers: {},
+                body: payload,
+                onRequestStart: req => {
+                    seen = req.headers;
+                },
+            });
+            const pool = new CallPool({ baseUrl });
+
+            try {
+                await pool.request<Buffer>("/clean", { binary: true });
+                expect(seen).not.toHaveProperty("binary");
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+    });
+
     describe("Edge Cases & Empty Bodies", () => {
         it("should handle empty JSON objects", async () => {
             const mockServer = new MockServer();

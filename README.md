@@ -265,6 +265,12 @@ Options for individual requests passed to the `request()` method.
 
 **Note**: Response parsing is automatic. If `Content-Type` contains `application/json`, the body is parsed as JSON. Textual media types and responses without `Content-Type` return a string; binary media types return a byte-preserving `Buffer`. Request bodies that are JavaScript objects are automatically serialized to JSON with the appropriate `Content-Type` header.
 
+**Fetching files**: a server that omits `Content-Type`, or labels a picture as text, would have its body decoded as UTF-8 and its bytes lost. Pass `binary: true` when you know you are downloading a file — the response then resolves as a `Buffer` whatever the header says, and JSON parsing is skipped. Error bodies stay textual, so a failure message is still readable.
+
+```typescript
+const image = await pool.request<Buffer>("/photos/1.jpg", { binary: true });
+```
+
 ### Example
 
 ```typescript

@@ -157,6 +157,8 @@ export class CallPool {
      * the limiter's queue; lower values run first. `response: "raw"` resolves with a
      * `{ status, headers, body }` envelope instead of the bare body, with the same
      * error/retry semantics; `exposeCookies` additionally reveals Set-Cookie there.
+     * `binary: true` reads the body as bytes whatever `Content-Type` says, for
+     * servers that omit or misreport it.
      * @throws {CallPoolError} On a non-retryable HTTP failure, or after retries are exhausted.
      * @throws {Error} If `priority` is not an integer between 0 and 9.
      */
@@ -206,7 +208,7 @@ export class CallPool {
     }
 
     private async executeOnce<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean): Promise<CallPoolResponse<T>> {
-        const { body: requestBody, headers: requestHeaders, method = "GET", ...dispatcherOptions } = reqOpts;
+        const { body: requestBody, headers: requestHeaders, method = "GET", binary = false, ...dispatcherOptions } = reqOpts;
         // The type-level Omit doesn't stop plain-JS callers: drop the key for real.
         delete (dispatcherOptions as { throwOnError?: boolean }).throwOnError;
         let body = requestBody;
@@ -236,7 +238,13 @@ export class CallPool {
         const statusCode = response.statusCode;
         const resHeaders = this.sanitizeHeaders(response.headers);
         const contentType = this.getHeaderValue(resHeaders["content-type"]);
-        const isBinaryResponse = statusCode < 400 && contentType !== undefined && !contentType.includes("application/json") && !this.isTextContentType(contentType);
+        // `binary` is the caller's own answer to the question the header is
+        // meant to answer: a server that omits Content-Type, or calls a JPEG
+        // text, would otherwise cost the response its bytes in a UTF-8 decode.
+        const isBinaryResponse =
+            statusCode < 400 &&
+            (binary ||
+                (contentType !== undefined && !contentType.includes("application/json") && !this.isTextContentType(contentType)));
 
         // Preserve bytes only for successful binary media. Text, JSON and error
         // bodies keep their established string representation.
@@ -299,13 +307,15 @@ export class CallPool {
     }
 
     private parseBody<T>(statusCode: number, rawBody: string | Buffer, resHeaders: Record<string, string | string[] | undefined>): T {
+        // Bytes were asked for, explicitly or by content type: parsing them
+        // back into JSON would undo the very thing that was requested.
+        if (Buffer.isBuffer(rawBody)) return rawBody as unknown as T;
         const contentType = this.getHeaderValue(resHeaders["content-type"]);
         if (contentType && contentType.includes("application/json")) {
-            const textBody = typeof rawBody === "string" ? rawBody : rawBody.toString("utf8");
             try {
-                return JSON.parse(textBody) as T;
+                return JSON.parse(rawBody) as T;
             } catch {
-                throw new CallPoolError("Invalid JSON response", { statusCode, body: textBody, headers: resHeaders, retryable: false });
+                throw new CallPoolError("Invalid JSON response", { statusCode, body: rawBody, headers: resHeaders, retryable: false });
             }
         }
 
