@@ -25,8 +25,10 @@ export interface CallPoolOptions {
         enabled?: boolean;
 
         /**
-         * true: Measures only TTFB (Time To First Byte). Great for variable payloads.
-         * false: Measures complete download.
+         * true: Measures TTFB (Time To First Byte) and updates the controller as
+         * soon as non-error response headers arrive, before reading the body.
+         * That sample is retained even if the later body download fails.
+         * false: Updates the controller after the complete body download.
          * Default: true
          */
         useTTFB?: boolean;

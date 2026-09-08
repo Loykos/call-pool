@@ -236,6 +236,11 @@ export class CallPool {
 
         const ttfb = performance.now() - start;
         const statusCode = response.statusCode;
+        const adaptThisResponse = this.adaptiveEnabled && statusCode < 400;
+        // TTFB feedback can change scheduling while this body is still downloading.
+        if (adaptThisResponse && this.useTTFB && ttfb > 0) {
+            this.updateThrottleLogic(ttfb);
+        }
         const resHeaders = this.sanitizeHeaders(response.headers);
         const contentType = this.getHeaderValue(resHeaders["content-type"]);
         // `binary` is the caller's own answer to the question the header is
@@ -250,11 +255,10 @@ export class CallPool {
         // bodies keep their established string representation.
         const rawBody = isBinaryResponse ? Buffer.from(await response.body.arrayBuffer()) : await response.body.text();
 
-        const measuredDuration = this.useTTFB ? ttfb : performance.now() - start;
-
-        // Adaptive Logic Hook
-        if (this.adaptiveEnabled && measuredDuration > 0 && statusCode < 400) {
-            this.updateThrottleLogic(measuredDuration);
+        // Full-download mode samples here; TTFB mode already sampled at headers.
+        if (adaptThisResponse && !this.useTTFB) {
+            const measuredDuration = performance.now() - start;
+            if (measuredDuration > 0) this.updateThrottleLogic(measuredDuration);
         }
 
         // A Buffer rawBody implies isBinaryResponse, hence statusCode < 400:

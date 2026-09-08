@@ -390,6 +390,10 @@ When enabled, the pool automatically monitors request latency and slows down whe
 -   If requests are slower than the average multiplied by `adaptive.congestionRatio` for `adaptive.breachLimit` consecutive samples, it reduces concurrency
 -   When requests become fast again, it restores concurrency gradually
 
+With `adaptive.useTTFB: true` (the default), the controller receives the latency sample as soon as non-error response headers arrive, so scheduling can adapt while the body is still downloading. With `false`, the sample is recorded after the complete body download, before parsing. Each attempt contributes at most one sample; 4xx/5xx responses are excluded. In TTFB mode, a recorded sample is retained even if the subsequent body download fails.
+
+Requests keep their concurrency slot until they finish, including body consumption and retries. Scheduler updates retain the existing 250 ms tuning interval.
+
 ## Introspection
 
 -   `pool.getCurrentConcurrency()`: current concurrency limit (the live adaptive value when adaptive throttling is enabled)
