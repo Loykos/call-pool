@@ -212,11 +212,11 @@ export class CallPool {
         // The type-level Omit doesn't stop plain-JS callers: drop the key for real.
         delete (dispatcherOptions as { throwOnError?: boolean }).throwOnError;
         let body = requestBody;
-        const headers = { ...this.defaultHeaders, ...requestHeaders } as Record<string, string>;
+        const headers = this.mergeHeaders(requestHeaders);
 
         if (body && typeof body === "object" && !Buffer.isBuffer(body) && !(body instanceof Uint8Array)) {
             body = JSON.stringify(body);
-            if (!this.hasHeader(headers, "content-type")) headers["Content-Type"] = "application/json";
+            if (!("content-type" in headers)) headers["content-type"] = "application/json";
         }
 
         if (this.rateGate) await this.rateGate.acquire();
@@ -336,9 +336,15 @@ export class CallPool {
         );
     }
 
-    private hasHeader(headers: Record<string, string>, name: string) {
-        const lowerName = name.toLowerCase();
-        return Object.keys(headers).some(key => key.toLowerCase() === lowerName);
+    private mergeHeaders(requestHeaders?: Record<string, string>): Record<string, string> {
+        const headers: Record<string, string> = Object.create(null);
+        // Normalize each source separately so request overrides always win,
+        // even when defaults contain multiple spellings of the same name.
+        for (const [name, value] of Object.entries(this.defaultHeaders)) headers[name.toLowerCase()] = value;
+        if (requestHeaders) {
+            for (const [name, value] of Object.entries(requestHeaders)) headers[name.toLowerCase()] = value;
+        }
+        return headers;
     }
 
     private getHeaderValue(value: string | string[] | undefined) {

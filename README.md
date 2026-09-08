@@ -352,6 +352,8 @@ const newUser = await pool.request<User>("/users", {
 | `response`      | `"body" \| "raw"`                                  | No       | `"body"` | `"raw"` resolves with a `{ status, headers, body }` envelope    |
 | `exposeCookies` | `boolean`                                          | No       | `false`  | Reveals `Set-Cookie` in the raw envelope (redacted by default)  |
 
+Header names are matched case-insensitively: request headers override `network.defaultHeaders`, so `authorization` replaces a default `Authorization`. If the same name appears with different casing within either object, the last entry wins. Each header name is sent once, and the input objects are left untouched.
+
 Every other [undici `RequestOptions`](https://github.com/nodejs/undici/blob/main/docs/docs/api/Dispatcher.md#parameter-requestoptions) field (`query`, `maxRedirections`, `idempotent`, `headersTimeout`, ...) is passed through 1:1, except `throwOnError`, which is excluded because it would bypass the pool's error and retry policy.
 
 ### Raw Responses
