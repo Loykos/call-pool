@@ -351,6 +351,7 @@ const newUser = await pool.request<User>("/users", {
 | `priority`      | `number`                                           | No       | `5`      | Queue priority (0-9, lower numbers run first; 0 is highest)     |
 | `body`          | `string \| Buffer \| Uint8Array \| object \| null` | No       | -        | Request body (JS objects are automatically serialized to JSON)  |
 | `headers`       | `Record<string, string>`                           | No       | -        | Additional headers for the single request                       |
+| `signal`        | `AbortSignal \| null`                              | No       | -        | Cancels queued work, quota/minTime waits, HTTP and retries        |
 | `response`      | `"body" \| "raw"`                                  | No       | `"body"` | `"raw"` resolves with a `{ status, headers, body }` envelope    |
 | `exposeCookies` | `boolean`                                          | No       | `false`  | Reveals `Set-Cookie` in the raw envelope (redacted by default)  |
 
@@ -410,7 +411,19 @@ Requests keep their concurrency slot until they finish, including body consumpti
 -   **Other 4xx (Client Error)**: No retry is performed
 -   **Network Error**: Automatic retry with exponential backoff
 -   **Invalid local request arguments**: Propagated immediately without retry
--   **AbortSignal**: Pass a `signal` in the request options to cancel a request; an aborted request is never retried, and pending retry waits resolve immediately
+-   **AbortSignal**: Pass an optional `signal` to cancel a logical request, including scheduler queue, quota/`minTime` waits, HTTP/body download, and retry backoff. The rejection preserves `signal.reason`, and an aborted request is never retried. Cancelling while queued removes the job promptly; cancelling while waiting for rate permission releases its concurrency slot without charging that pending permission. An active HTTP attempt keeps its slot until the transport settles. Abort listeners and unused rate wake timers are removed when their waits end.
+
+```typescript
+const controller = new AbortController();
+const pending = pool.request("/report", { signal: controller.signal });
+controller.abort(new Error("Report no longer needed"));
+
+try {
+    await pending;
+} catch (error) {
+    if (error !== controller.signal.reason) throw error;
+}
+```
 
 HTTP-level failures are thrown as `CallPoolError`, which exposes the response details:
 

@@ -155,7 +155,7 @@ export class CallPool {
      *
      * @param path - Request path, appended to `baseUrl`.
      * @param options - Per-request overrides. `signal` aborts the request, including
-     * any pending retry wait. `priority` (0-9, default 5) sets scheduling order in
+     * queue, quota/minTime and retry waits. `priority` (0-9, default 5) sets scheduling order in
      * the limiter's queue; lower values run first. `response: "raw"` resolves with a
      * `{ status, headers, body }` envelope instead of the bare body, with the same
      * error/retry semantics; `exposeCookies` additionally reveals Set-Cookie there.
@@ -172,7 +172,8 @@ export class CallPool {
         if (!Number.isInteger(priority) || priority < 0 || priority > 9) {
             throw new Error("[CallPool] 'priority' must be an integer between 0 and 9");
         }
-        const envelope = await this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, reqOpts, exposeCookies));
+        const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
+        const envelope = await this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, reqOpts, exposeCookies), signal);
         return response === "raw" ? envelope : envelope.body;
     }
 
@@ -183,13 +184,18 @@ export class CallPool {
         // Retry waits happen INSIDE the scheduler slot: a retrying logical job
         // keeps occupying its concurrency slot, which acts as natural backpressure.
         for (let attempt = 1; ; attempt++) {
-            if (signal?.aborted) throw signal.reason ?? new Error("Request aborted");
+            signal?.throwIfAborted();
 
             try {
-                return await this.executeOnce<T>(path, reqOpts, exposeCookies);
+                const response = await this.executeOnce<T>(path, reqOpts, exposeCookies);
+                signal?.throwIfAborted();
+                return response;
             } catch (err) {
+                // Undici and timers can wrap abort errors. Preserve the caller's
+                // reason consistently, including non-Error values and null.
+                signal?.throwIfAborted();
                 const retryable = this.isRetryableError(err);
-                if (!retryable || signal?.aborted || attempt >= this.maxAttempts) throw err;
+                if (!retryable || attempt >= this.maxAttempts) throw err;
 
                 // A 429 carries its own (capped) Retry-After wait, honored
                 // as-is instead of stacking the backoff delay on top of it.
@@ -222,7 +228,12 @@ export class CallPool {
             if (!("content-type" in headers)) headers["content-type"] = "application/json";
         }
 
-        if (this.rateGate) await this.rateGate.acquire();
+        const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
+        signal?.throwIfAborted();
+        if (this.rateGate) await this.rateGate.acquire(signal);
+        // Abort can arrive after the gate grants permission but before this
+        // async continuation resumes. Do not dispatch HTTP in that case.
+        signal?.throwIfAborted();
         const start = performance.now();
         const response = await this.client.request({
             ...dispatcherOptions,

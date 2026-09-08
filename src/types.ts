@@ -160,6 +160,9 @@ export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin"
     body?: string | Buffer | Uint8Array | object | null;
     headers?: Record<string, string>;
     /**
+     * Optional cancellation for the entire logical request: scheduler queue,
+     * quota/minTime waits, HTTP/body download, and retry backoff. Rejections
+     * preserve signal.reason; an aborted request is never retried.
      * Narrowed to AbortSignal only (undici also accepts a legacy EventEmitter
      * shape, but the retry loop's abort guards would not see it).
      */
