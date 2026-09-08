@@ -170,6 +170,8 @@ export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin"
      * body alone; `"raw"` resolves with a {@link CallPoolResponse} envelope
      * carrying status and headers as well. Error and retry semantics are
      * identical in both modes: 4xx/5xx still reject with CallPoolError.
+     * Options typed as RequestOptions return T | CallPoolResponse<T> when
+     * the response mode is not known at compile time.
      */
     response?: "body" | "raw";
 
@@ -204,7 +206,11 @@ export interface CallPoolResponse<T = unknown> {
     status: number;
     /** Response headers (Set-Cookie is redacted unless `exposeCookies` is set) */
     headers: Record<string, string | string[] | undefined>;
-    /** Body, parsed with the same rules as the default mode (JSON/text/Buffer) */
+    /**
+     * Body, parsed with the same rules as the default mode (JSON/text/Buffer).
+     * Empty HEAD/204/205/304 responses have an undefined body, or an empty
+     * Buffer with binary: true. Use T = void or T | undefined as appropriate.
+     */
     body: T;
 }
 

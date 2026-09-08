@@ -30,7 +30,8 @@
         "test:watch": "vitest --watch",
         "test:coverage": "vitest --coverage",
         "test:ui": "vitest --ui",
-        "test:run": "vitest run"
+        "test:run": "vitest run && pnpm test:types",
+        "test:types": "tsc --project tests/types/tsconfig.json"
     },
     "keywords": [
         "http",

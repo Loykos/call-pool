@@ -124,7 +124,7 @@ const pool = new CallPool({
 });
 
 // Usage examples
-// JSON parsing is automatic when Content-Type is application/json
+// JSON parsing is automatic for application/json and media types ending in +json
 const users = await pool.request<User[]>("/users");
 
 const newUser = await pool.request<User>("/users", {
@@ -263,7 +263,9 @@ const mtlsPool = new CallPool({
 
 Options for individual requests passed to the `request()` method.
 
-**Note**: Response parsing is automatic. If `Content-Type` contains `application/json`, the body is parsed as JSON. Textual media types and responses without `Content-Type` return a string; binary media types return a byte-preserving `Buffer`. Request bodies that are JavaScript objects are automatically serialized to JSON with the appropriate `Content-Type` header.
+**Note**: Response parsing is automatic. The media type in `Content-Type` is matched case-insensitively, ignoring parameters such as `charset`. `application/json` and types ending in `+json` (such as `application/vnd.api+json`) are parsed as JSON. Textual media types and responses without `Content-Type` return a string; binary media types return a byte-preserving `Buffer`. Request bodies that are JavaScript objects are automatically serialized to JSON with the appropriate `Content-Type` header.
+
+Empty responses to `HEAD`, or with status `204`, `205`, or `304`, resolve with `undefined` (also as `body` in raw mode). With `binary: true`, they resolve with an empty `Buffer`. Other empty or malformed JSON responses still reject with a non-retryable `CallPoolError`. Use `request<void>()` when no content is expected, or include `undefined` in the body type when an endpoint can return either content or no content. HTTP errors still reject, including on `HEAD` requests.
 
 **Fetching files**: a server that omits `Content-Type`, or labels a picture as text, would have its body decoded as UTF-8 and its bytes lost. Pass `binary: true` when you know you are downloading a file — the response then resolves as a `Buffer` whatever the header says, and JSON parsing is skipped. Error bodies stay textual, so a failure message is still readable.
 
@@ -294,7 +296,7 @@ const result = await pool.request("/users", {
 });
 
 // PUT request
-// Response JSON is automatically parsed when Content-Type is application/json
+// Response JSON is automatically parsed for application/json and +json media types
 await pool.request("/users/123", {
     method: "PUT",
     body: { name: "Jane" },
@@ -370,6 +372,8 @@ if (res.status === 302) {
     const next = res.headers["location"];
 }
 ```
+
+When options are held in a variable typed as `RequestOptions`, `request<T>()` returns `Promise<T | CallPoolResponse<T>>` because `response` can be either mode. Literal `response: "raw"` still returns `Promise<CallPoolResponse<T>>`; literal `"body"` or omitted options return `Promise<T>`.
 
 `Set-Cookie` is redacted everywhere by default so session cookies can't leak through logged responses or errors. When the cookie **is** the data (e.g. session bootstrap), opt in per request:
 

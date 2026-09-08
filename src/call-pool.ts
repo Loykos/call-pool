@@ -144,8 +144,10 @@ export class CallPool {
      * automatic retries on transient failures.
      *
      * Resolves with the response body parsed as JSON when the response's
-     * `Content-Type` is `application/json`, as a string for textual content, or
-     * as a byte-preserving Buffer for binary content.
+     * `Content-Type` is `application/json` or has a `+json` suffix (case-insensitive),
+     * as a string for textual content, or as a byte-preserving Buffer for binary
+     * content. Empty HEAD/204/205/304 responses resolve with undefined unless
+     * `binary: true` requests an empty Buffer.
      * HTTP failures (4xx/5xx) reject with {@link CallPoolError}; retryable failures
      * (429, 408, 5xx) are retried up to `retry.maxAttempts`, honoring a capped
      * `Retry-After` wait on 429s. Network-level errors (DNS, connection reset,
@@ -164,6 +166,7 @@ export class CallPool {
      */
     public async request<T = unknown>(path: string, options?: RequestOptions & { response?: "body" }): Promise<T>;
     public async request<T = unknown>(path: string, options: RequestOptions & { response: "raw" }): Promise<CallPoolResponse<T>>;
+    public async request<T = unknown>(path: string, options?: RequestOptions): Promise<T | CallPoolResponse<T>>;
     public async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T | CallPoolResponse<T>> {
         const { priority = 5, response = "body", exposeCookies = false, ...reqOpts } = options;
         if (!Number.isInteger(priority) || priority < 0 || priority > 9) {
@@ -242,14 +245,11 @@ export class CallPool {
             this.updateThrottleLogic(ttfb);
         }
         const resHeaders = this.sanitizeHeaders(response.headers);
-        const contentType = this.getHeaderValue(resHeaders["content-type"]);
+        const responseType = this.getResponseBodyType(this.getHeaderValue(resHeaders["content-type"]));
         // `binary` is the caller's own answer to the question the header is
         // meant to answer: a server that omits Content-Type, or calls a JPEG
         // text, would otherwise cost the response its bytes in a UTF-8 decode.
-        const isBinaryResponse =
-            statusCode < 400 &&
-            (binary ||
-                (contentType !== undefined && !contentType.includes("application/json") && !this.isTextContentType(contentType)));
+        const isBinaryResponse = statusCode < 400 && (binary || responseType === "binary");
 
         // Preserve bytes only for successful binary media. Text, JSON and error
         // bodies keep their established string representation.
@@ -265,12 +265,16 @@ export class CallPool {
         // assertSuccess never reads the body there, so skip the utf8 decode.
         this.assertSuccess(statusCode, typeof rawBody === "string" ? rawBody : "", resHeaders);
 
+        // Only bodyless HTTP responses skip decoding. An empty ordinary JSON
+        // response is still invalid, and an explicit byte request stays a Buffer.
+        const emptyResponse = rawBody.length === 0 && (method === "HEAD" || statusCode === 204 || statusCode === 205 || statusCode === 304);
+
         // Errors above always carry the sanitized copy; the opt-in only
         // uncovers Set-Cookie in the success envelope the caller asked for.
         return {
             status: statusCode,
             headers: exposeCookies ? { ...response.headers } : resHeaders,
-            body: this.parseBody<T>(statusCode, rawBody, resHeaders),
+            body: emptyResponse && !binary ? undefined as T : this.parseBody<T>(statusCode, rawBody, resHeaders, responseType === "json"),
         };
     }
 
@@ -310,12 +314,11 @@ export class CallPool {
         }
     }
 
-    private parseBody<T>(statusCode: number, rawBody: string | Buffer, resHeaders: Record<string, string | string[] | undefined>): T {
+    private parseBody<T>(statusCode: number, rawBody: string | Buffer, resHeaders: Record<string, string | string[] | undefined>, isJson: boolean): T {
         // Bytes were asked for, explicitly or by content type: parsing them
         // back into JSON would undo the very thing that was requested.
         if (Buffer.isBuffer(rawBody)) return rawBody as unknown as T;
-        const contentType = this.getHeaderValue(resHeaders["content-type"]);
-        if (contentType && contentType.includes("application/json")) {
+        if (isJson) {
             try {
                 return JSON.parse(rawBody) as T;
             } catch {
@@ -326,18 +329,22 @@ export class CallPool {
         return rawBody as unknown as T;
     }
 
-    private isTextContentType(contentType: string): boolean {
+    private getResponseBodyType(contentType: string | undefined): "json" | "text" | "binary" {
+        if (contentType === undefined) return "text";
+        // Share one classification between byte reading and JSON decoding;
+        // media type parameters must not influence either decision.
         const mediaType = contentType.split(";", 1)[0].trim().toLowerCase();
-        return (
+        if (mediaType === "application/json" || mediaType.endsWith("+json")) return "json";
+        if (
             mediaType.startsWith("text/") ||
-            mediaType.endsWith("+json") ||
             mediaType.endsWith("+xml") ||
             mediaType === "application/xml" ||
             mediaType === "application/javascript" ||
             mediaType === "application/x-javascript" ||
             mediaType === "application/x-www-form-urlencoded" ||
             mediaType === "image/svg+xml"
-        );
+        ) return "text";
+        return "binary";
     }
 
     private mergeHeaders(requestHeaders?: Record<string, string>): Record<string, string> {

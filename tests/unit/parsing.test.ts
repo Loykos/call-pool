@@ -1,9 +1,31 @@
 import { describe, it, expect } from "vitest";
-import { CallPool } from "../../src/index";
+import { CallPool, CallPoolError } from "../../src/index";
 import { MockServer } from "../setup/mock-server";
 
 describe.concurrent("Parsing Logic", () => {
     describe("JSON Parsing", () => {
+        it.each([
+            "Application/JSON",
+            "APPLICATION/JSON; charset=UTF-8",
+            "application/vnd.api+json",
+            "Application/Problem+JSON ; charset=utf-8",
+        ])("should parse %s consistently in body and raw modes", async contentType => {
+            const mockServer = new MockServer();
+            const data = { ok: true };
+            const baseUrl = await mockServer.start({ headers: { "Content-Type": contentType }, body: data });
+            const pool = new CallPool({ baseUrl });
+            try {
+                await expect(pool.request("/body")).resolves.toEqual(data);
+                const raw = await pool.request("/raw", { response: "raw" });
+                expect(raw.body).toEqual(data);
+                expect(raw.headers["content-type"]).toBe(contentType);
+                // An explicit byte request must still bypass JSON decoding.
+                await expect(pool.request("/bytes", { binary: true })).resolves.toEqual(Buffer.from(JSON.stringify(data)));
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
         it("should automatically parse JSON objects and arrays", async () => {
             const mockServer = new MockServer();
             const data = { id: 1, tags: ["api", "test"] };
@@ -57,6 +79,22 @@ describe.concurrent("Parsing Logic", () => {
     });
 
     describe("Text & Fallback Parsing", () => {
+        it.each([
+            { contentType: 'text/plain; profile="application/json"', binary: false },
+            { contentType: "application/json-seq", binary: true },
+            { contentType: "Application/Atom+XML; charset=utf-8", binary: false },
+        ])("should classify only the media type: $contentType", async ({ contentType, binary }) => {
+            const mockServer = new MockServer();
+            const payload = "not JSON";
+            const baseUrl = await mockServer.start({ headers: { "Content-Type": contentType }, body: payload });
+            const pool = new CallPool({ baseUrl });
+            try {
+                await expect(pool.request("/content")).resolves.toEqual(binary ? Buffer.from(payload) : payload);
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
         it("should return raw text when Content-Type is not JSON (text/plain, text/html)", async () => {
             const mockServer = new MockServer();
             const html = "<html><body>Hi</body></html>";
@@ -211,6 +249,78 @@ describe.concurrent("Parsing Logic", () => {
     });
 
     describe("Edge Cases & Empty Bodies", () => {
+        it.each([
+            { method: "GET", statusCode: 204 },
+            { method: "GET", statusCode: 205 },
+            { method: "GET", statusCode: 304 },
+            { method: "HEAD", statusCode: 200 },
+        ] as const)("should accept an empty $method response with status $statusCode", async ({ method, statusCode }) => {
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({
+                statusCode,
+                headers: { "Content-Type": "application/json", "X-Request-Id": "empty" },
+                body: "",
+            });
+            const pool = new CallPool({ baseUrl });
+            try {
+                await expect(pool.request<void>("/empty", { method })).resolves.toBeUndefined();
+                const raw = await pool.request<void>("/empty", { method, response: "raw" });
+                expect(raw.status).toBe(statusCode);
+                expect(raw.headers["x-request-id"]).toBe("empty");
+                expect(raw).toHaveProperty("body", undefined);
+                await expect(pool.request<Buffer>("/empty", { method, binary: true })).resolves.toEqual(Buffer.alloc(0));
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
+        it.each(["application/octet-stream", "text/plain", undefined])("should return undefined for 204 with %s", async contentType => {
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({
+                statusCode: 204,
+                headers: contentType ? { "Content-Type": contentType } : {},
+                body: "",
+            });
+            const pool = new CallPool({ baseUrl });
+            try {
+                await expect(pool.request("/empty")).resolves.toBeUndefined();
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
+        it("should keep HEAD HTTP errors as errors", async () => {
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({ statusCode: 404, body: "" });
+            const pool = new CallPool({ baseUrl });
+            try {
+                await expect(pool.request("/missing", { method: "HEAD" })).rejects.toMatchObject({
+                    statusCode: 404, body: "", retryable: false,
+                });
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
+        it("should keep vendor JSON HTTP errors textual and sanitized", async () => {
+            const mockServer = new MockServer();
+            const body = '{"detail":"missing"}';
+            const baseUrl = await mockServer.start({
+                statusCode: 404,
+                headers: { "Content-Type": "application/problem+json", "Set-Cookie": "sid=secret" },
+                body,
+            });
+            const pool = new CallPool({ baseUrl });
+            try {
+                await expect(pool.request("/missing", { binary: true, response: "raw", exposeCookies: true })).rejects.toMatchObject({
+                    statusCode: 404, body, retryable: false, headers: { "set-cookie": "[redacted]" },
+                });
+                expect(mockServer.getRequestCount()).toBe(1);
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
         it("should handle empty JSON objects", async () => {
             const mockServer = new MockServer();
             const baseUrl = await mockServer.start({
@@ -227,17 +337,24 @@ describe.concurrent("Parsing Logic", () => {
             }
         });
 
-        it("should throw a parsing error when JSON is expected but body is invalid/empty", async () => {
+        it.each([
+            { contentType: "application/json", body: "not-a-json" },
+            { contentType: "application/json", body: "" },
+            { contentType: "application/vnd.api+json", body: "not-a-json" },
+            { contentType: "Application/JSON", body: "" },
+        ])("should reject invalid JSON on 200: $contentType, '$body'", async ({ contentType, body }) => {
             const mockServer = new MockServer();
             const baseUrl = await mockServer.start({
-                headers: { "Content-Type": "application/json" },
-                body: "not-a-json",
+                headers: { "Content-Type": contentType },
+                body,
             });
             const pool = new CallPool({ baseUrl });
 
             try {
-                // response.body.json() will fail internally
-                await expect(pool.request("/invalid-json")).rejects.toThrow();
+                const error = await pool.request("/invalid-json").catch(error => error);
+                expect(error).toBeInstanceOf(CallPoolError);
+                expect(error).toMatchObject({ message: "Invalid JSON response", statusCode: 200, body, retryable: false });
+                expect(mockServer.getRequestCount()).toBe(1);
             } finally {
                 await Promise.all([pool.close(), mockServer.stop()]);
             }
