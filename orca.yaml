@@ -1,0 +1,12 @@
+# Orca worktree lifecycle for this repo. Orca reads it from the primary
+# checkout and asks for approval on every change: these commands run locally.
+scripts:
+  setup: pnpm install
+
+# The agent starts once setup is done: launched in parallel it would work on a
+# half-provisioned environment.
+setupAgentStartupPolicy: wait-for-setup
+
+# Tabs opened in new worktrees (never on main, which already exists).
+defaultTabs:
+  - title: shell
