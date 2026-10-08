@@ -55,6 +55,8 @@ export class CallPool {
     private rateLimitedUntil: number = -Infinity;
     /** Successes still required after the last 429 before concurrency may grow */
     private rateLimitHold: number = 0;
+    /** Pause of the last rate-limit episode, doubled when the server refuses again before recovery */
+    private rateLimitBackoff: number = 0;
 
     // Limiter State
     private currentConcurrency: number;
@@ -215,7 +217,9 @@ export class CallPool {
                 signal?.throwIfAborted();
                 // The signal is the server's, whatever this request does next:
                 // a 429 on the last attempt still says the pool is too fast.
-                if (err instanceof CallPoolError && err.statusCode === 429) this.onRateLimited(err.retryAfterMs ?? delay);
+                if (err instanceof CallPoolError && err.statusCode === 429) {
+                    this.onRateLimited(err.retryAfterMs ?? delay, Boolean(this.getHeaderValue(err.headers?.["retry-after"])));
+                }
                 const retryable = this.isRetryableError(err);
                 if (!retryable || attempt >= this.maxAttempts) throw err;
 
@@ -471,15 +475,19 @@ export class CallPool {
      * A 429 under `adaptive.rateLimitSignal`: one decrease per episode, the
      * episode extended by every later 429, growth held for `recoveryAfter`
      * successes and, with `pause`, every new attempt held until the wait the
-     * server asked for is over.
+     * server asked for is over. A server that names no wait and refuses again
+     * before the pool has recovered gets twice the previous pause, up to
+     * `retry.maxRetryAfter`: the default wait was evidently too short.
      */
-    private onRateLimited(waitMs: number) {
+    private onRateLimited(waitMs: number, explicit: boolean) {
         const signal = this.rateLimitSignal;
         if (!signal) return;
 
         const now = performance.now();
         const newEpisode = now >= this.rateLimitedUntil;
-        this.rateLimitedUntil = Math.max(this.rateLimitedUntil, now + waitMs);
+        if (newEpisode) this.rateLimitBackoff = this.episodeWait(waitMs, explicit);
+        const wait = explicit ? waitMs : Math.max(waitMs, this.rateLimitBackoff);
+        this.rateLimitedUntil = Math.max(this.rateLimitedUntil, now + wait);
         this.rateLimitHold = signal.recoveryAfter;
         this.congestionHits = 0;
 
@@ -489,6 +497,11 @@ export class CallPool {
             this.flushLimiterUpdate();
         }
         if (signal.pause) this.rateGate?.pauseUntil(this.rateLimitedUntil);
+    }
+
+    private episodeWait(waitMs: number, explicit: boolean): number {
+        const escalate = !explicit && this.rateLimitHold > 0;
+        return escalate ? Math.min(Math.max(waitMs, this.rateLimitBackoff * 2), this.maxRetryAfter) : waitMs;
     }
 
     private applyNewSettings(newConcurrency: number) {
