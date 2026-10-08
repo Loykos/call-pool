@@ -153,6 +153,7 @@ function validateAdaptiveOptions(adaptive: CallPoolOptions["adaptive"], concurre
             throw new Error("[CallPool] 'adaptive.minConcurrency' cannot exceed 'concurrency.limit'");
         }
     }
+    validateRateLimitSignal(adaptive.rateLimitSignal);
     if (adaptive.initialConcurrency !== undefined) {
         if (!Number.isInteger(adaptive.initialConcurrency) || adaptive.initialConcurrency < 1) {
             throw new Error("[CallPool] 'adaptive.initialConcurrency' must be a positive integer");
@@ -163,5 +164,22 @@ function validateAdaptiveOptions(adaptive: CallPoolOptions["adaptive"], concurre
         if (adaptive.initialConcurrency < (adaptive.minConcurrency ?? 1)) {
             throw new Error("[CallPool] 'adaptive.initialConcurrency' cannot be lower than 'adaptive.minConcurrency'");
         }
+    }
+}
+
+function validateRateLimitSignal(signal: NonNullable<CallPoolOptions["adaptive"]>["rateLimitSignal"]): void {
+    if (signal === undefined || typeof signal === "boolean") return;
+    if (typeof signal !== "object" || signal === null || Array.isArray(signal)) {
+        throw new Error("[CallPool] 'adaptive.rateLimitSignal' must be a boolean or an object");
+    }
+    const { decreaseFactor, pause, recoveryAfter } = signal;
+    if (decreaseFactor !== undefined && (!Number.isFinite(decreaseFactor) || decreaseFactor <= 0 || decreaseFactor >= 1)) {
+        throw new Error("[CallPool] 'adaptive.rateLimitSignal.decreaseFactor' must be greater than 0 and less than 1");
+    }
+    if (pause !== undefined && typeof pause !== "boolean") {
+        throw new Error("[CallPool] 'adaptive.rateLimitSignal.pause' must be a boolean");
+    }
+    if (recoveryAfter !== undefined && (!Number.isInteger(recoveryAfter) || recoveryAfter < 0)) {
+        throw new Error("[CallPool] 'adaptive.rateLimitSignal.recoveryAfter' must be a non-negative integer");
     }
 }

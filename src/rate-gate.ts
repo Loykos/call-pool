@@ -24,6 +24,7 @@ export class RateGate {
     private tokens: number;
     private windowIndex = 0;
     private lastStartAt = -Infinity;
+    private pausedUntil = -Infinity;
     private wakeTimer: NodeJS.Timeout | null = null;
     private stopped = false;
 
@@ -51,6 +52,23 @@ export class RateGate {
             }
             this.dispatch();
         });
+    }
+
+    /**
+     * Holds every attempt not yet started until `until` (a `performance.now()`
+     * timestamp). A pause only ever extends: an earlier deadline is ignored.
+     */
+    pauseUntil(until: number): void {
+        if (this.stopped || until <= this.pausedUntil) return;
+        this.pausedUntil = until;
+        // A pending wake was computed without the pause: start over from now.
+        this.clearWakeTimer();
+        this.dispatch();
+    }
+
+    /** Milliseconds left in the current pause, 0 when not paused. */
+    pausedFor(now: number = performance.now()): number {
+        return Math.max(0, this.pausedUntil - now);
     }
 
     stop(): void {
@@ -81,7 +99,7 @@ export class RateGate {
 
     private startDelay(now: number): number {
         const spacingWait = this.lastStartAt + this.minTime - now;
-        return Math.max(spacingWait, this.quotaWait(now), 0);
+        return Math.max(spacingWait, this.quotaWait(now), this.pausedUntil - now, 0);
     }
 
     private quotaWait(now: number): number {

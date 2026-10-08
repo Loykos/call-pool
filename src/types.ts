@@ -71,6 +71,16 @@ export interface CallPoolOptions {
          * Default: `concurrency.limit`
          */
         initialConcurrency?: number;
+
+        /**
+         * Treats a 429 as a pool-wide signal instead of a per-request one.
+         * Without it a 429 only makes the request that received it wait, while
+         * the other slots keep sending at full concurrency — the latency-based
+         * controller never sees the 429, since it samples successful responses
+         * only. `true` enables the defaults of {@link RateLimitSignalOptions}.
+         * Default: false
+         */
+        rateLimitSignal?: boolean | RateLimitSignalOptions;
     };
 
     /** Retry Configuration (Resilience) */
@@ -110,6 +120,34 @@ export interface CallPoolOptions {
          */
         proxy?: string;
     };
+}
+
+/**
+ * How a 429 steers an adaptive pool. One rate-limit episode — the 429 and
+ * every other 429 received before its wait is over — counts once: the
+ * requests already in flight when the server starts refusing must not drive
+ * the concurrency to its floor all together.
+ */
+export interface RateLimitSignalOptions {
+    /**
+     * Multiplicative decrease applied to concurrency once per episode, never
+     * below `adaptive.minConcurrency` and always at least one slot.
+     * Must be greater than 0 and less than 1. Default: 0.5
+     */
+    decreaseFactor?: number;
+
+    /**
+     * Holds every new HTTP attempt of the pool — not only the retry of the
+     * refused request — until the episode's wait is over: the `Retry-After`
+     * the server sent, or the retry delay when it sent none. Default: true
+     */
+    pause?: boolean;
+
+    /**
+     * Successful responses required after the last 429 before the controller
+     * may grow concurrency again. A non-negative integer. Default: 10
+     */
+    recoveryAfter?: number;
 }
 
 /**
@@ -225,4 +263,6 @@ export interface CallPoolStats {
     running: number;
     /** Current concurrency limit (dynamically tuned when adaptive is enabled) */
     concurrency: number;
+    /** Milliseconds left before new attempts may start after a 429 (`rateLimitSignal.pause`), 0 otherwise */
+    pausedFor: number;
 }

@@ -179,6 +179,10 @@ await pool.close();
 | `adaptive.decreaseFactor` | `number`  | No       | `0.9`   | Multiplicative decrease factor applied during congestion. Must be greater than 0 and less than 1                  |
 | `adaptive.minConcurrency` | `number`  | No       | `1`     | Lower bound for adaptive concurrency. Cannot exceed `concurrency.limit`                                           |
 | `adaptive.initialConcurrency` | `number` | No    | `concurrency.limit` | Starting concurrency for the adaptive algorithm (slow-start). Must be between `minConcurrency` and `concurrency.limit` |
+| `adaptive.rateLimitSignal` | `boolean \| object` | No | `false` | Treats a 429 as a pool-wide signal (see [Rate-limit signal](#rate-limit-signal)). `true` uses the defaults below |
+| `adaptive.rateLimitSignal.decreaseFactor` | `number` | No | `0.5` | Multiplicative concurrency cut applied once per rate-limit episode. Must be greater than 0 and less than 1 |
+| `adaptive.rateLimitSignal.pause` | `boolean` | No | `true` | Holds every new attempt of the pool until the episode's `Retry-After` is over |
+| `adaptive.rateLimitSignal.recoveryAfter` | `number` | No | `10` | Successful responses required after the last 429 before concurrency may grow again |
 
 ### Retry Configuration
 
@@ -399,14 +403,32 @@ With `adaptive.useTTFB: true` (the default), the controller receives the latency
 
 Requests keep their concurrency slot until they finish, including body consumption and retries. Scheduler updates retain the existing 250 ms tuning interval.
 
+### Rate-limit signal
+
+The latency controller samples successful responses only, so on its own it never sees a 429: the refused request waits its `Retry-After`, and the other slots keep sending at full concurrency. With `adaptive.rateLimitSignal` a 429 steers the whole pool instead:
+
+-   **One cut per episode**: concurrency is multiplied by `decreaseFactor` (never below `minConcurrency`, always at least one slot) and applied at once, without the tuning debounce. Every 429 received before the episode's wait is over extends it without cutting again, so the requests already in flight when the server starts refusing do not drive concurrency to its floor together.
+-   **Pause** (`pause: true`): no new HTTP attempt starts — first attempts and retries alike — until the wait the server asked for is over (`Retry-After`, capped at `retry.maxRetryAfter`; 5s when the header is missing). `getStats().pausedFor` reports the time left.
+-   **Recovery hold**: after the last 429 the controller may grow concurrency again only after `recoveryAfter` successful responses; until then the fast responses that would normally signal headroom do not.
+
+The option requires `adaptive.enabled`; it is ignored otherwise.
+
+```typescript
+const pool = new CallPool({
+    baseUrl: "https://portal.example.com",
+    concurrency: { limit: 10 },
+    adaptive: { enabled: true, minConcurrency: 1, rateLimitSignal: { decreaseFactor: 0.5, recoveryAfter: 20 } },
+});
+```
+
 ## Introspection
 
 -   `pool.getCurrentConcurrency()`: current concurrency limit (the live adaptive value when adaptive throttling is enabled)
--   `pool.getStats()`: live snapshot of the pool — `{ queued, running, concurrency }`
+-   `pool.getStats()`: live snapshot of the pool — `{ queued, running, concurrency, pausedFor }`
 
 ## Error Handling
 
--   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits exactly that long (capped at `retry.maxRetryAfter`, default 60s) before retrying — no extra backoff is stacked on top
+-   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits exactly that long (capped at `retry.maxRetryAfter`, default 60s) before retrying — no extra backoff is stacked on top. With `adaptive.rateLimitSignal` the 429 also cuts the pool's concurrency and pauses its other requests (see [Rate-limit signal](#rate-limit-signal))
 -   **5xx (Server Error) and 408 (Request Timeout)**: Automatic retry with exponential backoff
 -   **Other 4xx (Client Error)**: No retry is performed
 -   **Network Error**: Automatic retry with exponential backoff

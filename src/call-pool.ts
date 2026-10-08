@@ -1,6 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { Pool, ProxyAgent, errors } from "undici";
-import { CallPoolOptions, CallPoolResponse, CallPoolStats, CallPoolTlsOptions, RequestOptions } from "./types.js";
+import { CallPoolOptions, CallPoolResponse, CallPoolStats, CallPoolTlsOptions, RateLimitSignalOptions, RequestOptions } from "./types.js";
 import { CallPoolError, PoolClosedError } from "./errors.js";
 import { RateGate } from "./rate-gate.js";
 import { RequestScheduler } from "./scheduler.js";
@@ -8,6 +8,8 @@ import { validateOptions } from "./validation.js";
 
 /** Per-request options left after the pool-level keys are extracted. */
 type TransportOptions = Omit<RequestOptions, "priority" | "response" | "exposeCookies">;
+
+const RATE_LIMIT_SIGNAL_DEFAULTS: Required<RateLimitSignalOptions> = { decreaseFactor: 0.5, pause: true, recoveryAfter: 10 };
 
 export class CallPool {
     private client: Pool | ProxyAgent;
@@ -33,6 +35,9 @@ export class CallPool {
     private increaseStep: number;
     private decreaseFactor: number;
 
+    // Rate-limit signal (adaptive only): null when 429s stay per-request
+    private rateLimitSignal: Required<RateLimitSignalOptions> | null;
+
     // Adaptive Bounds
     private minConcurrency: number;
     private maxConcurrency: number; // Initialized to concurrency.limit
@@ -46,6 +51,10 @@ export class CallPool {
     private pendingUpdateTimer: NodeJS.Timeout | null = null;
     private avgLatency: number = 0;
     private congestionHits: number = 0;
+    /** End of the current rate-limit episode (performance.now() timebase) */
+    private rateLimitedUntil: number = -Infinity;
+    /** Successes still required after the last 429 before concurrency may grow */
+    private rateLimitHold: number = 0;
 
     // Limiter State
     private currentConcurrency: number;
@@ -74,6 +83,7 @@ export class CallPool {
         this.breachLimit = adaptOpts?.breachLimit ?? 2;
         this.increaseStep = adaptOpts?.increaseStep ?? 1;
         this.decreaseFactor = adaptOpts?.decreaseFactor ?? 0.9;
+        this.rateLimitSignal = this.resolveRateLimitSignal(adaptOpts);
 
         // Adaptive Bounds Setup (validation guarantees 1 <= minConcurrency <= limit)
         this.minConcurrency = adaptOpts?.minConcurrency ?? 1;
@@ -97,7 +107,16 @@ export class CallPool {
         this.client = this.createClient(options.baseUrl, concurrencyLimit, options.network?.tls, options.network?.proxy);
         this.scheduler = new RequestScheduler({ maxConcurrent: this.currentConcurrency });
         const minTime = this.computeBaseMinTime(rateOpts);
-        this.rateGate = minTime > 0 || rateOpts?.quota ? new RateGate({ minTime, quota: rateOpts?.quota }) : null;
+        // The pause of a rate-limit episode is enforced by the gate, so it is
+        // created even for a pool without contractual limits.
+        const needsGate = minTime > 0 || rateOpts?.quota || this.rateLimitSignal?.pause;
+        this.rateGate = needsGate ? new RateGate({ minTime, quota: rateOpts?.quota }) : null;
+    }
+
+    private resolveRateLimitSignal(adaptOpts: CallPoolOptions["adaptive"]): Required<RateLimitSignalOptions> | null {
+        const signal = adaptOpts?.rateLimitSignal;
+        if (!this.adaptiveEnabled || !signal) return null;
+        return { ...RATE_LIMIT_SIGNAL_DEFAULTS, ...(signal === true ? {} : signal) };
     }
 
     private computeBaseMinTime(rateOpts: CallPoolOptions["rateLimit"]): number {
@@ -194,6 +213,9 @@ export class CallPool {
                 // Undici and timers can wrap abort errors. Preserve the caller's
                 // reason consistently, including non-Error values and null.
                 signal?.throwIfAborted();
+                // The signal is the server's, whatever this request does next:
+                // a 429 on the last attempt still says the pool is too fast.
+                if (err instanceof CallPoolError && err.statusCode === 429) this.onRateLimited(err.retryAfterMs ?? delay);
                 const retryable = this.isRetryableError(err);
                 if (!retryable || attempt >= this.maxAttempts) throw err;
 
@@ -251,6 +273,7 @@ export class CallPool {
         const ttfb = performance.now() - start;
         const statusCode = response.statusCode;
         const adaptThisResponse = this.adaptiveEnabled && statusCode < 400;
+        if (statusCode < 400 && this.rateLimitHold > 0) this.rateLimitHold--;
         // TTFB feedback can change scheduling while this body is still downloading.
         if (adaptThisResponse && this.useTTFB && ttfb > 0) {
             this.updateThrottleLogic(ttfb);
@@ -430,15 +453,42 @@ export class CallPool {
     }
 
     private increaseConcurrency() {
+        // After a 429 the latency baseline says nothing about the server's
+        // quota: growth waits for `recoveryAfter` successes.
+        if (this.rateLimitHold > 0) return;
         const next = Math.min(this.currentConcurrency + this.increaseStep, this.maxConcurrency);
         this.applyNewSettings(next);
     }
 
-    private reduceConcurrency() {
+    private reduceConcurrency(factor: number = this.decreaseFactor) {
         // AIMD decrease: multiplicative factor, but always at least -1 connection.
-        const raw = Math.min(this.currentConcurrency * this.decreaseFactor, this.currentConcurrency - 1);
+        const raw = Math.min(this.currentConcurrency * factor, this.currentConcurrency - 1);
         const next = Math.max(raw, this.minConcurrency);
         this.applyNewSettings(next);
+    }
+
+    /**
+     * A 429 under `adaptive.rateLimitSignal`: one decrease per episode, the
+     * episode extended by every later 429, growth held for `recoveryAfter`
+     * successes and, with `pause`, every new attempt held until the wait the
+     * server asked for is over.
+     */
+    private onRateLimited(waitMs: number) {
+        const signal = this.rateLimitSignal;
+        if (!signal) return;
+
+        const now = performance.now();
+        const newEpisode = now >= this.rateLimitedUntil;
+        this.rateLimitedUntil = Math.max(this.rateLimitedUntil, now + waitMs);
+        this.rateLimitHold = signal.recoveryAfter;
+        this.congestionHits = 0;
+
+        if (newEpisode) {
+            this.reduceConcurrency(signal.decreaseFactor);
+            // The server is refusing now: apply the cut without the debounce.
+            this.flushLimiterUpdate();
+        }
+        if (signal.pause) this.rateGate?.pauseUntil(this.rateLimitedUntil);
     }
 
     private applyNewSettings(newConcurrency: number) {
@@ -496,6 +546,7 @@ export class CallPool {
             queued: this.scheduler.queued,
             running: this.scheduler.running,
             concurrency: this.currentConcurrency,
+            pausedFor: this.rateGate?.pausedFor() ?? 0,
         };
     }
 
