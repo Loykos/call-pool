@@ -4,6 +4,8 @@ import { CallPoolOptions, CallPoolResponse, CallPoolStats, NetworkOptions, Statu
 import { CallPoolError, PoolClosedError } from "./errors.js";
 import { RateGate } from "./rate-gate.js";
 import { RequestScheduler } from "./scheduler.js";
+import { CircuitBreaker } from "./circuit-breaker.js";
+import { matchesCode, parseRetryAfter } from "./http-policy.js";
 import { RequestDeadline } from "./request-deadline.js";
 import { validateOptions, validateMaxElapsedTime } from "./validation.js";
 
@@ -27,10 +29,8 @@ export class CallPool {
     private maxElapsedTime: number | undefined;
     private maxDelay: number;
     private retryCodes: readonly StatusCodeSelector[];
-    private pauseCodes: readonly StatusCodeSelector[];
+    private breaker: CircuitBreaker | undefined;
     private retryNetworkErrors: boolean;
-    private pauseUntil = -Infinity;
-    private pauseBackoff: number | undefined;
     private defaultHeaders: Record<string, string>;
 
     // Adaptive Config (Flattened for perf)
@@ -42,7 +42,7 @@ export class CallPool {
     private increaseStep: number;
     private decreaseFactor: number;
 
-    // Optional adaptive concurrency feedback, independent of retry/pause selectors.
+    // Optional adaptive concurrency feedback, independent of retry/circuit selectors.
     private rateLimitSignal: Required<RateLimitSignalOptions> | null;
 
     // Adaptive Bounds
@@ -80,7 +80,7 @@ export class CallPool {
         validateOptions(options);
 
         const concurrencyLimit = options.concurrency?.limit ?? 1;
-        const rateOpts = options.rateLimit;
+        const rateOpts = options.rateLimit?.enabled ? options.rateLimit : undefined;
         const adaptOpts = options.adaptive;
 
         // --- 1. ADAPTIVE CONFIGURATION ---
@@ -106,8 +106,8 @@ export class CallPool {
         this.maxRetryAfter = options.retry?.maxRetryAfter ?? 60_000;
         this.maxElapsedTime = options.maxElapsedTime;
         this.maxDelay = options.retry?.maxDelay ?? 60_000;
-        this.retryCodes = [...(options.retry?.codes ?? [408, 429, "5xx"])];
-        this.pauseCodes = [...(options.retry?.pauseCodes ?? [])];
+        this.retryCodes = [...(options.retry?.codes ?? [403, 408, 429, "5xx"])];
+        this.breaker = options.circuitBreaker?.enabled ? new CircuitBreaker(options.circuitBreaker) : undefined;
         this.retryNetworkErrors = options.retry?.networkErrors ?? true;
 
         // --- 3. CONCURRENCY SETUP ---
@@ -119,10 +119,10 @@ export class CallPool {
         this.client = this.createClient(options.baseUrl, concurrencyLimit, options.network);
         this.scheduler = new RequestScheduler({ maxConcurrent: this.currentConcurrency });
         const minTime = this.computeBaseMinTime(rateOpts);
-        // The pause of a rate-limit episode is enforced by the gate, so it is
-        // created even for a pool without contractual limits.
-        const needsGate = minTime > 0 || rateOpts?.quota || this.pauseCodes.length > 0;
-        this.rateGate = needsGate ? new RateGate({ minTime, quota: rateOpts?.quota }) : null;
+        // The gate admits circuit probes atomically with quota/spacing, so it
+        // also exists for a breaker without contractual rate limits.
+        const needsGate = minTime > 0 || rateOpts?.quota || this.breaker;
+        this.rateGate = needsGate ? new RateGate({ minTime, quota: rateOpts?.quota, breaker: this.breaker }) : null;
     }
 
     private resolveRateLimitSignal(adaptOpts: CallPoolOptions["adaptive"]): Required<RateLimitSignalOptions> | null {
@@ -156,7 +156,7 @@ export class CallPool {
      * content. Empty HEAD/204/205/304 responses resolve with undefined unless
      * `binary: true` requests an empty Buffer.
      * HTTP failures (4xx/5xx) reject with {@link CallPoolError}; retryable failures
-     * (429, 408, 5xx by default) are retried up to `retry.maxAttempts`, honoring
+     * (403, 408, 429, 5xx by default) are retried up to `retry.maxAttempts`, honoring
      * a capped `Retry-After` wait on HTTP failures. Network-level errors (DNS, connection reset,
      * timeouts) propagate unchanged.
      * `maxElapsedTime` optionally bounds the whole logical request from
@@ -218,10 +218,8 @@ export class CallPool {
                 // Undici and timers can wrap abort errors. Preserve the caller's
                 // reason consistently, including non-Error values and null.
                 signal?.throwIfAborted();
-                // Pauses and adaptive feedback apply even when this request will
-                // not retry. Establish the pause before adaptive scheduling changes.
+                // Circuit feedback was already recorded before deciding to retry.
                 if (err instanceof CallPoolError && err.statusCode !== undefined && err.statusCode >= 400) {
-                    if (this.matchesCode(err.statusCode, this.pauseCodes)) this.onPause(err.retryAfterMs);
                     if (err.statusCode === 429) this.onRateLimited(err.retryAfterMs ?? delay);
                 }
                 const retryable = this.isRetryableError(err);
@@ -230,8 +228,8 @@ export class CallPool {
                 // An HTTP failure may carry a capped Retry-After wait, honored
                 // as-is instead of stacking the backoff delay on top of it.
                 const waitMs = err instanceof CallPoolError && err.retryAfterMs !== undefined ? err.retryAfterMs : delay;
-                // Pool pauses may have escalated well beyond this response's
-                // Retry-After fallback. Neither wait resets the total budget.
+                // The circuit may require a longer wait than this request's retry.
+                // Neither policy resets the total budget.
                 deadline?.assertCanWait(Math.max(waitMs, this.rateGate?.pausedFor() ?? 0), err);
                 delay = Math.min(delay * this.retryFactor, this.maxDelay);
                 // Abort resolves the wait instead of throwing: the loop's next
@@ -269,64 +267,75 @@ export class CallPool {
 
         const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
         signal?.throwIfAborted();
-        if (this.rateGate) await this.rateGate.acquire(signal, deadline);
-        // Abort can arrive after the gate grants permission but before this
-        // async continuation resumes. Do not dispatch HTTP in that case.
-        signal?.throwIfAborted();
-        const start = performance.now();
-        const response = await this.client.request({
-            ...dispatcherOptions,
-            // A Pool is bound to its origin; a ProxyAgent is origin-agnostic
-            // and must be told the tunnel target on every request.
-            ...(this.proxiedOrigin ? { origin: this.proxiedOrigin } : {}),
-            path,
-            method,
-            headers,
-            body: body as string | Buffer | Uint8Array | null,
-        });
+        const permit = this.rateGate ? await this.rateGate.acquire(signal, deadline) : undefined;
+        let observedStatus: number | undefined;
+        let observedRetryAfter: string | string[] | undefined;
+        let succeeded = false;
+        try {
+            // Abort can arrive after the gate grants permission but before this
+            // async continuation resumes. Do not dispatch HTTP in that case.
+            signal?.throwIfAborted();
+            if (this.closePromise) throw new PoolClosedError();
+            deadline?.assertCanWait(0);
+            const start = performance.now();
+            const response = await this.client.request({
+                ...dispatcherOptions,
+                // A Pool is bound to its origin; a ProxyAgent is origin-agnostic
+                // and must be told the tunnel target on every request.
+                ...(this.proxiedOrigin ? { origin: this.proxiedOrigin } : {}),
+                path,
+                method,
+                headers,
+                body: body as string | Buffer | Uint8Array | null,
+            });
 
-        const ttfb = performance.now() - start;
-        const statusCode = response.statusCode;
-        const adaptThisResponse = this.adaptiveEnabled && statusCode < 400;
-        if (statusCode < 400 && this.rateLimitHold > 0) this.rateLimitHold--;
-        // An older in-flight success cannot reset a newer refusal episode.
-        if (statusCode < 400 && start >= this.pauseUntil) this.pauseBackoff = undefined;
-        // TTFB feedback can change scheduling while this body is still downloading.
-        if (adaptThisResponse && this.useTTFB && ttfb > 0) {
-            this.updateThrottleLogic(ttfb);
+            const ttfb = performance.now() - start;
+            const statusCode = response.statusCode;
+            observedStatus = statusCode;
+            observedRetryAfter = response.headers["retry-after"];
+            const adaptThisResponse = this.adaptiveEnabled && statusCode < 400;
+            if (statusCode < 400 && this.rateLimitHold > 0) this.rateLimitHold--;
+            // TTFB feedback can change scheduling while this body is still downloading.
+            if (adaptThisResponse && this.useTTFB && ttfb > 0) {
+                this.updateThrottleLogic(ttfb);
+            }
+            const resHeaders = this.sanitizeHeaders(response.headers);
+            const responseType = this.getResponseBodyType(this.getHeaderValue(resHeaders["content-type"]));
+            // `binary` is the caller's own answer to the question the header is
+            // meant to answer: a server that omits Content-Type, or calls a JPEG
+            // text, would otherwise cost the response its bytes in a UTF-8 decode.
+            const isBinaryResponse = statusCode < 400 && (binary || responseType === "binary");
+
+            // Preserve bytes only for successful binary media. Text, JSON and error
+            // bodies keep their established string representation.
+            const rawBody = isBinaryResponse ? Buffer.from(await response.body.arrayBuffer()) : await response.body.text();
+
+            // Full-download mode samples here; TTFB mode already sampled at headers.
+            if (adaptThisResponse && !this.useTTFB) {
+                const measuredDuration = performance.now() - start;
+                if (measuredDuration > 0) this.updateThrottleLogic(measuredDuration);
+            }
+
+            // A Buffer rawBody implies isBinaryResponse, hence statusCode < 400:
+            // assertSuccess never reads the body there, so skip the utf8 decode.
+            this.assertSuccess(statusCode, typeof rawBody === "string" ? rawBody : "", resHeaders);
+
+            // Only bodyless HTTP responses skip decoding. An empty ordinary JSON
+            // response is still invalid, and an explicit byte request stays a Buffer.
+            const emptyResponse = rawBody.length === 0 && (method === "HEAD" || statusCode === 204 || statusCode === 205 || statusCode === 304);
+
+            // Errors above always carry the sanitized copy; the opt-in only
+            // uncovers Set-Cookie in the success envelope the caller asked for.
+            const result = {
+                status: statusCode,
+                headers: exposeCookies ? { ...response.headers } : resHeaders,
+                body: emptyResponse && !binary ? undefined as T : this.parseBody<T>(statusCode, rawBody, resHeaders, responseType === "json"),
+            };
+            succeeded = true;
+            return result;
+        } finally {
+            if (permit) this.breaker!.complete(permit, signal?.aborted ? undefined : observedStatus, observedRetryAfter, succeeded && !signal?.aborted);
         }
-        const resHeaders = this.sanitizeHeaders(response.headers);
-        const responseType = this.getResponseBodyType(this.getHeaderValue(resHeaders["content-type"]));
-        // `binary` is the caller's own answer to the question the header is
-        // meant to answer: a server that omits Content-Type, or calls a JPEG
-        // text, would otherwise cost the response its bytes in a UTF-8 decode.
-        const isBinaryResponse = statusCode < 400 && (binary || responseType === "binary");
-
-        // Preserve bytes only for successful binary media. Text, JSON and error
-        // bodies keep their established string representation.
-        const rawBody = isBinaryResponse ? Buffer.from(await response.body.arrayBuffer()) : await response.body.text();
-
-        // Full-download mode samples here; TTFB mode already sampled at headers.
-        if (adaptThisResponse && !this.useTTFB) {
-            const measuredDuration = performance.now() - start;
-            if (measuredDuration > 0) this.updateThrottleLogic(measuredDuration);
-        }
-
-        // A Buffer rawBody implies isBinaryResponse, hence statusCode < 400:
-        // assertSuccess never reads the body there, so skip the utf8 decode.
-        this.assertSuccess(statusCode, typeof rawBody === "string" ? rawBody : "", resHeaders);
-
-        // Only bodyless HTTP responses skip decoding. An empty ordinary JSON
-        // response is still invalid, and an explicit byte request stays a Buffer.
-        const emptyResponse = rawBody.length === 0 && (method === "HEAD" || statusCode === 204 || statusCode === 205 || statusCode === 304);
-
-        // Errors above always carry the sanitized copy; the opt-in only
-        // uncovers Set-Cookie in the success envelope the caller asked for.
-        return {
-            status: statusCode,
-            headers: exposeCookies ? { ...response.headers } : resHeaders,
-            body: emptyResponse && !binary ? undefined as T : this.parseBody<T>(statusCode, rawBody, resHeaders, responseType === "json"),
-        };
     }
 
     private sanitizeHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string | string[] | undefined> {
@@ -343,13 +352,9 @@ export class CallPool {
         const message = statusCode === 429 ? "Rate Limit Hit (429)" : `${statusCode >= 500 ? "Server" : "Client"} Error ${statusCode}: ${rawBody.substring(0, 200)}`;
         throw new CallPoolError(message, {
             statusCode, body: rawBody, headers: resHeaders,
-            retryable: this.matchesCode(statusCode, this.retryCodes),
-            retryAfterMs: this.parseRetryAfterMs(resHeaders["retry-after"]),
+            retryable: matchesCode(statusCode, this.retryCodes),
+            retryAfterMs: parseRetryAfter(resHeaders["retry-after"], this.maxRetryAfter),
         });
-    }
-
-    private matchesCode(code: number, selectors: readonly StatusCodeSelector[]): boolean {
-        return selectors.some(selector => selector === code || (selector === "4xx" && code >= 400 && code < 500) || (selector === "5xx" && code >= 500 && code < 600));
     }
 
     private parseBody<T>(statusCode: number, rawBody: string | Buffer, resHeaders: Record<string, string | string[] | undefined>, isJson: boolean): T {
@@ -398,33 +403,6 @@ export class CallPool {
 
     private getHeaderValue(value: string | string[] | undefined) {
         return Array.isArray(value) ? value[0] : value;
-    }
-
-    private parseRetryAfterMs(value: string | string[] | undefined) {
-        const retryAfter = this.getHeaderValue(value)?.trim();
-        if (!retryAfter) return undefined;
-        // Accept fractional seconds as well as integer delta-seconds. Numeric
-        // garbage (e.g. -1) must not accidentally parse as a historical date.
-        if (/^\d+(?:\.\d+)?$/.test(retryAfter)) {
-            const seconds = Number(retryAfter);
-            if (Number.isFinite(seconds)) return Math.min(seconds * 1000, this.maxRetryAfter);
-        }
-        if (!/[a-z]/i.test(retryAfter)) return undefined;
-        const retryAt = Date.parse(retryAfter);
-        return Number.isFinite(retryAt) ? Math.min(Math.max(0, retryAt - Date.now()), this.maxRetryAfter) : undefined;
-    }
-
-    /** Shared fallback advances once per episode, independently of adaptive. */
-    private onPause(retryAfterMs: number | undefined): void {
-        const now = performance.now();
-        if (now >= this.pauseUntil) {
-            this.pauseBackoff = retryAfterMs ?? (this.pauseBackoff === undefined
-                ? Math.min(this.retryDelay, this.maxDelay)
-                : Math.min(Math.max(this.retryDelay, this.pauseBackoff * this.retryFactor), this.maxDelay));
-        }
-        const wait = retryAfterMs ?? Math.min(Math.max(this.retryDelay, this.pauseBackoff ?? this.retryDelay), this.maxDelay);
-        this.pauseUntil = Math.max(this.pauseUntil, now + wait);
-        this.rateGate?.pauseUntil(this.pauseUntil);
     }
 
     // ==========================================
@@ -488,7 +466,7 @@ export class CallPool {
         if (!signal) return;
         const now = performance.now();
         const newEpisode = now >= this.rateLimitedUntil;
-        this.rateLimitedUntil = Math.max(this.rateLimitedUntil, this.pauseUntil, now + waitMs);
+        this.rateLimitedUntil = Math.max(this.rateLimitedUntil, now + (this.breaker?.pausedFor() ?? 0), now + waitMs);
         this.rateLimitHold = signal.recoveryAfter;
         this.congestionHits = 0;
         if (newEpisode) {
@@ -553,6 +531,7 @@ export class CallPool {
             running: this.scheduler.running,
             concurrency: this.currentConcurrency,
             pausedFor: this.rateGate?.pausedFor() ?? 0,
+            circuitBreaker: this.breaker?.getState() ?? "disabled",
         };
     }
 

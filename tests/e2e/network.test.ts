@@ -176,7 +176,7 @@ describe("429 recovery through a real TLS tunnel", () => {
         let banned = true;
         let requests = 0;
         const f = await fixture((_req, res) => { requests++; res.writeHead(banned ? 429 : 200); res.end(banned ? "banned" : "ok"); });
-        const pool = new CallPool({ baseUrl: f.baseUrl, maxElapsedTime: 400, retry: { pauseCodes: [429], delay: 800 }, network: { uri: f.uri, requestTls: { ca: cert } } });
+        const pool = new CallPool({ baseUrl: f.baseUrl, maxElapsedTime: 400, circuitBreaker: { enabled: true, failureThreshold: 1, halfOpen: { after: 800 } }, retry: { delay: 800 }, network: { uri: f.uri, requestTls: { ca: cert } } });
         try {
             const start = performance.now();
             const results = await Promise.allSettled(Array.from({ length: 150 }, (_, i) => pool.request(`/row-${i}`)));
@@ -198,7 +198,7 @@ describe("429 recovery through a real TLS tunnel", () => {
             arrivals.push({ path: req.url!, at: performance.now() });
             res.writeHead(req.url === "/banned" ? 429 : 200).end("result");
         });
-        const pool = new CallPool({ baseUrl: f.baseUrl, retry: { pauseCodes: [429], delay: 50, factor: 2, maxDelay: 120 }, network: { uri: f.uri, requestTls: { ca: cert }, pipelining: 0 } });
+        const pool = new CallPool({ baseUrl: f.baseUrl, circuitBreaker: { enabled: true, failureThreshold: 1, halfOpen: { after: 120 } }, retry: { delay: 50, factor: 2, maxDelay: 120 }, network: { uri: f.uri, requestTls: { ca: cert }, pipelining: 0 } });
         try {
             const failed = pool.request("/banned").catch(error => error);
             const queued = pool.request("/queued");
@@ -212,5 +212,66 @@ describe("429 recovery through a real TLS tunnel", () => {
             expect(gaps[2]).toBeGreaterThanOrEqual(119);
             expect(f.tunnels).toHaveLength(4);
         } finally { await pool.close(); await f.stop(); }
+    });
+});
+
+describe("circuit breaker over real HTTPS/CONNECT", () => {
+    it("opens on three 403s and serializes two successful probes before releasing the queue", async () => {
+        const arrivals: string[] = [];
+        const held: import("node:http").ServerResponse[] = [];
+        let recoveryRequests = 0;
+        const f = await fixture((req, res) => {
+            arrivals.push(req.url!);
+            if (req.url!.startsWith("/blocked")) res.writeHead(403).end("blocked");
+            else if (++recoveryRequests <= 2) held.push(res);
+            else res.end("ok");
+        });
+        const pool = new CallPool({ baseUrl: f.baseUrl, concurrency: { limit: 4 }, retry: { maxAttempts: 1 }, circuitBreaker: { enabled: true, halfOpen: { after: 100 } }, network: { uri: f.uri, requestTls: { ca: cert } } });
+        try {
+            const refused = await Promise.allSettled([0, 1, 2].map(i => pool.request(`/blocked-${i}`)));
+            expect(refused.every(result => result.status === "rejected")).toBe(true);
+            expect(pool.getStats().circuitBreaker).toBe("open");
+            const pending = Array.from({ length: 8 }, (_, i) => pool.request(`/recovery-${i}`));
+            await expect.poll(() => held.length).toBe(1);
+            expect(arrivals).toHaveLength(4);
+            expect(pool.getStats().circuitBreaker).toBe("half-open");
+            held.shift()!.end("ok");
+            await expect.poll(() => held.length).toBe(1);
+            expect(arrivals).toHaveLength(5);
+            expect(pool.getStats().circuitBreaker).toBe("half-open");
+            held.shift()!.end("ok");
+            expect(await Promise.all(pending)).toEqual(Array(8).fill("ok"));
+            expect(pool.getStats()).toMatchObject({ circuitBreaker: "closed", queued: 0, running: 0 });
+            expect(arrivals).toHaveLength(11);
+        } finally { held.splice(0).forEach(res => res.end("ok")); await pool.close(); await f.stop(); }
+    });
+
+    it("reopens after a late failed parallel probe even when another probe already succeeded", async () => {
+        let arrivals = 0;
+        const held: import("node:http").ServerResponse[] = [];
+        const f = await fixture((_req, res) => {
+            arrivals++;
+            if (arrivals === 1) res.writeHead(403).end("blocked");
+            else if (arrivals <= 3) held.push(res);
+            else res.end("ok");
+        });
+        const pool = new CallPool({ baseUrl: f.baseUrl, concurrency: { limit: 4 }, retry: { maxAttempts: 1 }, circuitBreaker: { enabled: true, failureThreshold: 1, halfOpen: { after: 100, maxConcurrent: 2, successThreshold: 1 } }, network: { uri: f.uri, requestTls: { ca: cert }, pipelining: 0 } });
+        try {
+            await expect(pool.request("/trip")).rejects.toMatchObject({ statusCode: 403 });
+            const pending = Array.from({ length: 4 }, (_, i) => pool.request(`/probe-${i}`).catch(error => error));
+            await expect.poll(() => held.length).toBe(2);
+            held.splice(held.findIndex(res => res.req.url === "/probe-0"), 1)[0].end("ok");
+            await expect(pending[0]).resolves.toBe("ok");
+            expect(pool.getStats().circuitBreaker).toBe("half-open");
+            expect(arrivals).toBe(3);
+            held.shift()!.writeHead(403).end("still blocked");
+            await expect(pending[1]).resolves.toMatchObject({ statusCode: 403 });
+            expect(pool.getStats().circuitBreaker).toBe("open");
+            expect(arrivals).toBe(3);
+            await Promise.all(pending);
+            expect(pool.getStats().circuitBreaker).toBe("closed");
+            expect(arrivals).toBe(5);
+            expect(f.tunnels).toHaveLength(5);
+        } finally { held.splice(0).forEach(res => res.end("ok")); await pool.close(); await f.stop(); }
     });
 });

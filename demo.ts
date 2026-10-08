@@ -10,6 +10,7 @@ async function demo() {
             limit: 5,
         },
         rateLimit: {
+            enabled: true,
             minTime: 100, // 100ms between requests
         },
         retry: {

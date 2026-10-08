@@ -14,6 +14,6 @@ describe("0.8 configuration migration guards", () => {
 
     it("rejects the previous adaptive pause control", () => {
         expect(() => new CallPool({ baseUrl: "http://localhost", adaptive: { rateLimitSignal: { pause: false } } } as CallPoolOptions))
-            .toThrow("'adaptive.rateLimitSignal.pause' moved to 'retry.pauseCodes'");
+            .toThrow("'adaptive.rateLimitSignal.pause' was replaced by 'circuitBreaker'");
     });
 });

@@ -98,7 +98,7 @@ describe("CallPool - Adaptive Throttling Integration", () => {
                 const pool = new CallPool({
                     baseUrl: url,
                     concurrency: { limit: LIMIT },
-                    rateLimit: { minTime: 0 },
+                    rateLimit: { enabled: true, minTime: 0 },
                     retry: { maxAttempts: 3, delay: 200 },
                     adaptive:
                         mode === "ADAPTIVE"

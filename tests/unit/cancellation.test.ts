@@ -208,7 +208,7 @@ describe("Cancellation", () => {
 
     it("releases a quota-waiting slot without sending HTTP or consuming the next quota", async () => {
         vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
-        const pool = new CallPool({ baseUrl: "http://localhost", rateLimit: { quota: { max: 1, window: 1000 } } });
+        const pool = new CallPool({ baseUrl: "http://localhost", rateLimit: { enabled: true, quota: { max: 1, window: 1000 } } });
         const request = transport(pool).mockResolvedValue(response());
         const controller = new AbortController();
         const reason = new Error("cancel quota wait");
@@ -267,7 +267,7 @@ describe("Cancellation", () => {
     });
 
     it("does not send HTTP when abort arrives between a quota grant and its continuation", async () => {
-        const pool = new CallPool({ baseUrl: "http://localhost", rateLimit: { quota: { max: 1, window: 1000 } } });
+        const pool = new CallPool({ baseUrl: "http://localhost", rateLimit: { enabled: true, quota: { max: 1, window: 1000 } } });
         const request = transport(pool).mockResolvedValue(response());
         const controller = new AbortController();
         const reason = new Error("cancel before HTTP");
@@ -305,7 +305,7 @@ describe("Cancellation", () => {
     it("also cancels quota waits entered by a retry", async () => {
         const pool = new CallPool({
             baseUrl: "http://localhost",
-            rateLimit: { quota: { max: 1, window: 60_000 } },
+            rateLimit: { enabled: true, quota: { max: 1, window: 60_000 } },
             retry: { maxAttempts: 3, delay: 1 },
         });
         const request = transport(pool).mockResolvedValue(response(503));

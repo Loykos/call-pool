@@ -53,7 +53,7 @@ describe.concurrent("Configuration Enforcement", () => {
 
         it("should fail early on invalid numeric configuration", () => {
             expect(() => new CallPool({ baseUrl: "http://localhost", concurrency: { limit: 0 } })).toThrow(/concurrency\.limit/);
-            expect(() => new CallPool({ baseUrl: "http://localhost", rateLimit: { minTime: -1 } })).toThrow(/rateLimit\.minTime/);
+            expect(() => new CallPool({ baseUrl: "http://localhost", rateLimit: { enabled: true, minTime: -1 } })).toThrow(/rateLimit\.minTime/);
             expect(() => new CallPool({ baseUrl: "http://localhost", retry: { maxAttempts: 0 } })).toThrow(/retry\.maxAttempts/);
             expect(() => new CallPool({ baseUrl: "http://localhost", adaptive: { decreaseFactor: 1 } })).toThrow(/adaptive\.decreaseFactor/);
             expect(() => new CallPool({ baseUrl: "http://localhost", retry: { maxRetryAfter: -1 } })).toThrow(/retry\.maxRetryAfter/);

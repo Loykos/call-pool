@@ -1,9 +1,10 @@
 import { CompactingQueue } from "./compacting-queue.js";
 import { PoolClosedError } from "./errors.js";
+import { CircuitBreaker, type CircuitPermit } from "./circuit-breaker.js";
 import { RequestDeadline } from "./request-deadline.js";
 
 interface RateWaiter {
-    resolve: () => void;
+    resolve: (permit: CircuitPermit | undefined) => void;
     reject: (reason: unknown) => void;
     cleanupAbort?: () => void;
 }
@@ -26,21 +27,23 @@ export class RateGate {
     private tokens: number;
     private windowIndex = 0;
     private lastStartAt = -Infinity;
-    private pausedUntil = -Infinity;
+    private readonly breaker?: CircuitBreaker;
     private wakeTimer: NodeJS.Timeout | null = null;
     private stopped = false;
 
-    constructor(options: { minTime: number; quota?: { max: number; window: number } }) {
+    constructor(options: { minTime: number; quota?: { max: number; window: number }; breaker?: CircuitBreaker }) {
+        this.breaker = options.breaker;
+        if (this.breaker) this.breaker.onChange = () => { this.clearWakeTimer(); this.dispatch(); };
         this.minTime = options.minTime;
         this.quota = options.quota ?? null;
         this.tokens = this.quota?.max ?? Infinity;
     }
 
-    acquire(signal?: AbortSignal, deadline?: RequestDeadline): Promise<void> {
+    acquire(signal?: AbortSignal, deadline?: RequestDeadline): Promise<CircuitPermit | undefined> {
         signal = deadline?.signal ?? signal;
         if (this.stopped) return Promise.reject(new PoolClosedError());
         if (signal?.aborted) return Promise.reject(signal.reason);
-        return new Promise<void>((resolve, reject) => {
+        return new Promise<CircuitPermit | undefined>((resolve, reject) => {
             const waiter: RateWaiter = { resolve, reject };
             const entry = this.waiters.push(waiter);
             if (deadline) this.deadlines.add(deadline);
@@ -61,26 +64,15 @@ export class RateGate {
         });
     }
 
-    /**
-     * Holds every attempt not yet started until `until` (a `performance.now()`
-     * timestamp). A pause only ever extends: an earlier deadline is ignored.
-     */
-    pauseUntil(until: number): void {
-        if (this.stopped || until <= this.pausedUntil) return;
-        this.pausedUntil = until;
-        // A pending wake was computed without the pause: start over from now.
-        this.clearWakeTimer();
-        this.dispatch();
-    }
-
-    /** Milliseconds left in the current pause, 0 when not paused. */
-    pausedFor(now: number = performance.now()): number {
-        return Math.max(0, this.pausedUntil - now);
+    /** Milliseconds before the breaker can admit probes. */
+    pausedFor(): number {
+        return this.breaker?.pausedFor() ?? 0;
     }
 
     stop(): void {
         if (this.stopped) return;
         this.stopped = true;
+        if (this.breaker) this.breaker.onChange = undefined;
         this.clearWakeTimer();
 
         const closed = new PoolClosedError();
@@ -93,24 +85,26 @@ export class RateGate {
     private dispatch(): void {
         while (!this.stopped && this.waiters.size > 0) {
             const wait = this.startDelay(performance.now());
-            // Recheck all waiting budgets when a later 429 extends the pause.
+            // Recheck all waiting budgets when a later refusal extends the open period.
             // Abort synchronously removes each waiter through its listener.
             for (const deadline of this.deadlines) deadline.checkWait(wait);
             if (this.waiters.size === 0) return;
             if (wait > 0) return this.wake(wait);
 
+            const permit = this.breaker?.acquire();
+            if (permit === null) return; // Half-open capacity; completion wakes us.
             const waiter = this.waiters.take();
             if (!waiter) return;
             waiter.cleanupAbort?.();
             this.lastStartAt = performance.now();
             this.tokens--;
-            waiter.resolve();
+            waiter.resolve(permit);
         }
     }
 
     private startDelay(now: number): number {
         const spacingWait = this.lastStartAt + this.minTime - now;
-        return Math.max(spacingWait, this.quotaWait(now), this.pausedUntil - now, 0);
+        return Math.max(spacingWait, this.quotaWait(now), this.pausedFor(), 0);
     }
 
     private quotaWait(now: number): number {

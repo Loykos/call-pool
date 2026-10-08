@@ -58,6 +58,7 @@ const pool = new CallPool({
         limit: 5, // Maximum 5 concurrent requests
     },
     rateLimit: {
+        enabled: true,
         minTime: "auto", // Automatically calculates delay from quota
         quota: {
             max: 100, // 100 requests
@@ -79,47 +80,55 @@ const result = await pool.request("/api/data");
 await pool.close();
 ```
 
-### Full Configuration Example
+### All defaults
 
-Example combining scheduling, failure policy and native transport settings.
+`baseUrl` is required and has no default. Below are all CallPool defaults; additional `network` options retain Undici's defaults. `initialConcurrency` and `network.connections` follow the configured `concurrency.limit` unless explicitly overridden.
 
 ```typescript
 import { CallPool } from "call-pool";
 
 const pool = new CallPool({
-    baseUrl: "https://api.example.com",
-    concurrency: {
-        limit: 20, // 20 concurrent requests
+    baseUrl: "https://api.example.com", // Required caller-supplied value
+    concurrency: { limit: 1 },
+    rateLimit: { enabled: false, minTime: 0, quota: undefined },
+    adaptive: {
+        enabled: false,
+        useTTFB: true,
+        ignoreBelow: 100,
+        congestionRatio: 2,
+        breachLimit: 2,
+        increaseStep: 1,
+        decreaseFactor: 0.9,
+        minConcurrency: 1,
+        initialConcurrency: 1,
+        rateLimitSignal: false,
     },
-    rateLimit: {
-        minTime: 50, // 50ms between each request (or "auto" if using quota)
-        quota: {
-            max: 1000, // 1000 requests
-            window: 3600000, // in 1 hour
+    maxElapsedTime: undefined,
+    defaultHeaders: {},
+    retry: {
+        codes: [403, 408, 429, "5xx"],
+        networkErrors: true,
+        maxAttempts: 3,
+        delay: 1000,
+        factor: 2,
+        maxDelay: 60_000,
+        maxRetryAfter: 60_000,
+    },
+    circuitBreaker: {
+        enabled: false,
+        codes: [403, 429, 503],
+        failureThreshold: 3,
+        halfOpen: {
+            after: 10_000,
+            maxRetryAfter: 60_000,
+            maxConcurrent: 1,
+            successThreshold: 2,
         },
     },
-    adaptive: {
-        enabled: true, // Enable adaptive throttling
-        useTTFB: true, // Measure time to first byte instead of full download
-        ignoreBelow: 100, // Treat very fast requests as headroom signals
-        congestionRatio: 2.0, // Threshold for adaptive throttling
-        breachLimit: 2, // Consecutive congestion samples before slowing down
-        increaseStep: 1, // Additive recovery step
-        decreaseFactor: 0.9, // Multiplicative backoff factor
-        minConcurrency: 1, // Adaptive lower bound
-    },
-    retry: {
-        maxAttempts: 3, // Maximum 3 total attempts
-        delay: 1000, // 1 second initial delay
-        factor: 2, // Backoff between attempts: 1s, 2s
-    },
-    maxElapsedTime: 60_000, // Includes queue, attempts and all waits
-    defaultHeaders: {
-        Authorization: "Bearer your-token-here",
-        "User-Agent": "MyApp/1.0",
-        "Content-Type": "application/json",
-    },
     network: {
+        connections: 1,
+        pipelining: 1,
+        keepAliveTimeout: 10_000,
         headersTimeout: 30_000,
         bodyTimeout: 30_000,
     },
@@ -166,6 +175,7 @@ await pool.close();
 
 | Option                               | Type               | Required | Default | Description                                                                                                                                      |
 | ------------------------------------ | ------------------ | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `rateLimit.enabled` | `boolean` | No | `false` | Enables spacing and quota; otherwise neither is applied |
 | `rateLimit.minTime`                  | `number \| "auto"` | No       | `0`     | Minimum time between requests in ms, or `"auto"` for automatic calculation (requires `quota`)                                                    |
 | `rateLimit.quota.max`                | `number`           | No       | -       | Maximum number of requests allowed in the time window                                                                                            |
 | `rateLimit.quota.window`             | `number`           | No       | -       | Time window in ms (e.g., 60000 for 1 minute)                                                                                                     |
@@ -192,49 +202,66 @@ await pool.close();
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `retry.maxAttempts` | `number` | `3` | Total HTTP attempts, including the first |
-| `retry.codes` | `readonly (number \| "4xx" \| "5xx")[]` | `[408, 429, "5xx"]` | HTTP failures to retry; replaces defaults, `[]` disables HTTP retries |
-| `retry.pauseCodes` | same as `codes` | `[]` | HTTP failures that pause every new attempt of this pool |
+| `retry.codes` | `readonly (number \| "4xx" \| "5xx")[]` | `[403, 408, 429, "5xx"]` | HTTP failures to retry; replaces defaults, `[]` disables HTTP retries |
 | `retry.networkErrors` | `boolean` | `true` | Retry transport failures independently of HTTP selectors |
 | `retry.delay` | `number` | `1000` | Initial fallback wait in ms without a valid `Retry-After` |
-| `retry.factor` | `number` | `2` | Fallback multiplier per retry / shared pause episode |
+| `retry.factor` | `number` | `2` | Fallback multiplier per retry |
 | `retry.maxDelay` | `number` | `60000` | Cap in ms for fallback backoff, including the initial wait |
 | `retry.maxRetryAfter` | `number` | `60000` | Cap in ms for waits from a valid `Retry-After` |
 
-Numeric selectors must be integers from 400 to 599. The two lists are independent:
+Numeric selectors must be integers from 400 to 599. A valid `Retry-After` (seconds or HTTP date) replaces the fallback for that response, capped by `retry.maxRetryAfter`. Missing, empty or invalid headers use `delay`, multiplied by `factor` after each failed attempt and capped by `maxDelay`. HTTP failures and transport failures use the same total attempt budget. Cancellation and invalid local arguments are never retried.
 
-| Response matches | Refused request | Rest of pool |
+Retry waits occupy the logical request's concurrency slot. With concurrency 1, a retrying request therefore also holds up the queue even without a circuit breaker. Every actual retry acquires rate-limit and circuit permission again; waiting does not consume attempts or quota.
+
+### Circuit Breaker Configuration
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `circuitBreaker.enabled` | `boolean` | `false` | Explicitly enable the shared circuit |
+| `circuitBreaker.codes` | same selectors as `retry.codes` | `[403, 429, 503]` | HTTP failures that contribute to opening the circuit |
+| `circuitBreaker.failureThreshold` | `number` | `3` | Consecutive matching failures across all HTTP attempts in the pool |
+| `circuitBreaker.halfOpen.after` | `number` | `10000` | Fixed wait in ms before probes when Retry-After is missing/invalid |
+| `circuitBreaker.halfOpen.maxRetryAfter` | `number` | `60000` | Independent cap for the server's requested circuit wait |
+| `circuitBreaker.halfOpen.maxConcurrent` | `number` | `1` | Maximum simultaneous probe attempts, also subject to pool concurrency |
+| `circuitBreaker.halfOpen.successThreshold` | `number` | `2` | Completed successful probes needed to restore normal traffic |
+
+- **Closed:** attempts proceed normally. Matching failures, including retries and final failed attempts, increment a pool-wide counter. A completed successful response resets it. Non-matching HTTP errors and failures without a matching HTTP response do not increment or reset the counter. A matching HTTP refusal remains a failure even if reading its error body subsequently fails.
+- **Open:** new attempts wait, including pending retries. The queue is retained; there is no `onOpen` switch or automatic fail-fast error. Requests already admitted can finish. A matching late failure from the same closed generation can extend this open period, never shorten it.
+- **Half-open:** after the open wait expires, pending application requests are admitted as probes, up to `maxConcurrent`. No background health-check requests are generated. Successful probes count only after their bodies are fully consumed and parsed. Once `successThreshold` is reached, outstanding probes are drained before the circuit closes. Any matching failed probe reopens it immediately and resets recovery progress. Older generations cannot close or reopen a later probe cycle.
+
+A non-matching HTTP error, transport/parser failure, or cancellation during a probe releases its permission without counting as recovery. Other pending requests can then probe; network errors remain governed by `retry.networkErrors`. The breaker classifies **HTTP codes**, not transport failures. If no work is pending, it sends nothing and creates no periodic timer.
+
+The failure that opens/reopens the circuit supplies its `Retry-After`: a valid header replaces `halfOpen.after`, capped by `halfOpen.maxRetryAfter`. There is no implicit exponential escalation in the circuit; each unsuccessful probe cycle starts another fixed/header-directed wait. `halfOpen.after` is the delay before a probe cycle, not the interval between successful probes. Subsequent probes can start immediately, subject to rate limits.
+
+The retry and breaker lists are independent and may overlap:
+
+| Response matches | Refused request | Shared circuit |
 | --- | --- | --- |
-| `codes` only | Retries while attempts remain | Free slots can keep sending |
-| `pauseCodes` only | Rejects immediately after the response is consumed | New attempts wait; queued jobs are retained |
-| Both | Retries while attempts remain | New attempts wait |
-| Neither | Rejects | No shared pause |
+| `retry.codes` only | Retries while attempts remain | No failure contribution |
+| `circuitBreaker.codes` only | Rejects after the response | Contributes to the opening threshold |
+| Both | Retains its retry if attempts remain | Contributes to the opening threshold; retry waits for permission |
+| Neither | Rejects | No failure contribution |
 
-Retry waits occupy the logical request's concurrency slot. With concurrency 1, a retrying request therefore also holds up the queue even without a shared pause. In-flight HTTP attempts are never cancelled by a pause. Waiting does not consume attempts; every actual retry acquires rate-limit permission again. A matching final failure still pauses the pool.
+Retry and circuit waits overlap, never add up: each attempt waits until both policies allow it, then respects concurrency, spacing and quota. Their `maxRetryAfter` values are independent. Neither entering half-open nor closing the circuit resets a request's `maxAttempts` or `maxElapsedTime` budget.
 
-A valid `Retry-After` (seconds or HTTP date) replaces the fallback wait for that response, capped by `maxRetryAfter`. Missing, empty or invalid headers use `delay`, multiplied by `factor` after each failed attempt and capped by `maxDelay`. This applies to configured HTTP failures, including 503, not only 429.
-
-Shared fallback backoff advances once per pause episode: concurrent matching failures received during an existing pause can extend it but do not multiply it repeatedly. After the pause expires, a new matching failure starts the next episode. A successful response from an attempt started after the pause resets shared backoff; an older in-flight success does not. Explicit header waits are honored without multiplication, and become the base for a subsequent fallback episode, whose wait is at least `delay` (subject to `maxDelay`). A shorter wait never shortens an already active pause.
-
-Retry and pause waits overlap: a request can restart once both its own wait and the shared pause have elapsed, subject to concurrency, spacing and quota. Two matching 5-second waits do **not** become 10 seconds. `getStats().pausedFor` exposes the remaining shared pause.
-
-Pauses work without adaptive throttling. This is not a circuit breaker: the queue stays intact and resumes normally after the pause, without a half-open probe. A persistently refusing server can keep the queue waiting unless a total budget or cancellation is configured.
+The circuit works with `rateLimit.enabled: false` and `adaptive.enabled: false`. Without a total budget or cancellation, requests may remain queued while a portal keeps refusing. Configure `maxElapsedTime` to bound that waiting.
 
 ```ts
 const pool = new CallPool({
     baseUrl: "https://portal.example.com",
-    retry: {
-        codes: [408, 429, "5xx"],
-        pauseCodes: [429], // Explicit opt-in to shared pauses
-        delay: 1000,
-        factor: 2,
-        maxDelay: 60_000,
+    retry: { codes: [403, 408, 429, "5xx"], maxAttempts: 3 },
+    circuitBreaker: {
+        enabled: true,
+        codes: [403, 429, 503],
+        failureThreshold: 3,
+        halfOpen: { after: 10_000, maxRetryAfter: 60_000, maxConcurrent: 1, successThreshold: 2 },
     },
 });
 ```
 
 #### Bounding requests against a persistently rate-limited server
 
-`retry.maxDelay` and `retry.maxRetryAfter` cap individual waits; repeated pauses can still keep a request and the queue behind it waiting for minutes. Set `maxElapsedTime` to bound the whole logical request, starting when it is submitted to the pool:
+`retry.maxDelay`, `retry.maxRetryAfter` and `circuitBreaker.halfOpen.maxRetryAfter` cap individual waits; repeated pauses can still keep a request and the queue behind it waiting for minutes. Set `maxElapsedTime` to bound the whole logical request, starting when it is submitted to the pool:
 
 ```ts
 import { CallPool, CallPoolTimeoutError } from "call-pool";
@@ -242,7 +269,8 @@ import { CallPool, CallPoolTimeoutError } from "call-pool";
 const pool = new CallPool({
     baseUrl: "https://api.example.com",
     maxElapsedTime: 10_000,
-    retry: { maxAttempts: 3, pauseCodes: [429] },
+    retry: { maxAttempts: 3 },
+    circuitBreaker: { enabled: true },
 });
 
 try {
@@ -334,11 +362,18 @@ const proxied = new CallPool({
 | `network.defaultHeaders` | top-level `defaultHeaders` |
 | `network.tls` | `network.connect` directly, or `network.requestTls` through a proxy |
 | `CallPoolTlsOptions` | Undici's native connector/TLS types; `NetworkOptions` is exported |
-| `adaptive.rateLimitSignal.pause` | `retry.pauseCodes: [429]` to enable shared pauses, `[]` to disable |
+| `adaptive.rateLimitSignal.pause` | `circuitBreaker.enabled` enables shared protection with controlled recovery |
+| `rateLimit: { minTime, quota }` | Add `rateLimit.enabled: true` to apply either constraint |
 
-The removed configuration keys throw a migration error for JavaScript callers instead of being silently ignored. If you used the unreleased `retry.maxElapsedTime` option, move it to top-level `maxElapsedTime` (also available per request).
+The removed configuration keys throw a migration error for JavaScript callers instead of being silently ignored. If you used the unreleased `retry.maxElapsedTime` option, move it to top-level `maxElapsedTime` (also available per request). The draft `retry.pauseCodes` option was replaced by `circuitBreaker`; it is rejected at runtime and by TypeScript. Retry/breaker code overlap is intentionally allowed.
 
-**Behavior changes:** shared pauses now default to off, including with `adaptive.rateLimitSignal: true`. That option still controls concurrency reduction/recovery only. Enable `retry.pauseCodes: [429]` explicitly to preserve pool-wide waiting. Without a valid `Retry-After`, 429 now uses the same configurable fallback as other failures: 1s, 2s, 4s… capped by `maxDelay`, instead of a hidden 5s fallback. To start at 5s, set `retry.delay: 5000`. Retry backoff is now capped by `maxDelay`; valid `Retry-After` is also honored for configured HTTP failures other than 429. Shared backoff resets on a successful post-pause attempt independently of adaptive recovery.
+**Behavior changes:**
+
+- `rateLimit` now requires `enabled: true`; spacing and quota are off by default, even if their values are supplied. Configuration values are still validated when disabled.
+- `403` is now retried by default alongside 408, 429 and 5xx. Custom `retry.codes` replaces this list.
+- The circuit breaker defaults to off, including with `adaptive.rateLimitSignal: true`. That adaptive option only controls concurrency reduction/recovery. To react to the first 429 pool-wide, use `circuitBreaker: { enabled: true, codes: [429], failureThreshold: 1 }`. Recovery now goes through half-open probes, instead of releasing the full queue when a timer expires.
+- Without a valid `Retry-After`, retry waits use the same configurable fallback for every failure: 1s, 2s, 4s… capped by `maxDelay`, instead of the hidden 5s fallback for 429. Set `retry.delay: 5000` for a 5s initial retry. The circuit's separate fallback is `halfOpen.after` (10s by default), without implicit escalation.
+- Valid `Retry-After` is honored for configured HTTP failures other than 429. Retry and circuit waits use their respective caps independently.
 
 Native options are tied to the installed Undici major version (currently 6.x). No changes are required in the proxy server to configure client connection reuse.
 
@@ -487,7 +522,7 @@ Requests keep their concurrency slot until they finish, including body consumpti
 The latency controller samples successful responses only, so on its own it never sees a 429: the refused request waits its `Retry-After`, and the other slots keep sending at full concurrency. With `adaptive.rateLimitSignal` a 429 steers the whole pool instead:
 
 -   **One cut per episode**: concurrency is multiplied by `decreaseFactor` (never below `minConcurrency`, always at least one slot) and applied at once, without the tuning debounce. Every 429 received before the episode's wait is over extends it without cutting again, so the requests already in flight when the server starts refusing do not drive concurrency to its floor together.
--   **Separate pause policy**: `retry.pauseCodes` controls shared waiting independently of this signal and of `adaptive.enabled`.
+-   **Separate circuit policy**: `circuitBreaker` controls shared waiting and probes independently of this signal and of `adaptive.enabled`.
 -   **Recovery hold**: after the last 429 the controller may grow concurrency again only after `recoveryAfter` successful responses; until then the fast responses that would normally signal headroom do not.
 
 The concurrency signal requires `adaptive.enabled`; it is ignored otherwise. Shared pauses do not require either option.
@@ -503,12 +538,14 @@ const pool = new CallPool({
 ## Introspection
 
 -   `pool.getCurrentConcurrency()`: current concurrency limit (the live adaptive value when adaptive throttling is enabled)
--   `pool.getStats()`: live snapshot of the pool — `{ queued, running, concurrency, pausedFor }`
+-   `pool.getStats()`: live snapshot of the pool — `{ queued, running, concurrency, pausedFor, circuitBreaker }`
+-   `circuitBreaker` is `"disabled"`, `"closed"`, `"open"` or `"half-open"`. `pausedFor` is the remaining open wait; it is 0 during half-open even while probe capacity is occupied.
 
 ## Error Handling
 
--   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits exactly that long (capped at `retry.maxRetryAfter`, default 60s) before retrying — no extra backoff is stacked on top. `retry.pauseCodes` optionally pauses other attempts; `adaptive.rateLimitSignal` separately reduces concurrency (see [Rate-limit signal](#rate-limit-signal))
+-   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits exactly that long (capped at `retry.maxRetryAfter`, default 60s) before retrying — no extra backoff is stacked on top. `circuitBreaker` optionally suspends other attempts and controls recovery; `adaptive.rateLimitSignal` separately reduces concurrency (see [Rate-limit signal](#rate-limit-signal))
 -   **5xx (Server Error) and 408 (Request Timeout)**: Automatic retry with exponential backoff
+-   **403 (Forbidden)**: Retried by default and included in the default circuit selectors when the breaker is enabled
 -   **Other 4xx (Client Error)**: No retry by default; configurable with `retry.codes`
 -   **Network Error**: Automatic retry with exponential backoff unless `retry.networkErrors: false`
 -   **Invalid local request arguments**: Propagated immediately without retry
@@ -577,4 +614,4 @@ pnpm test:run       # Unit, integration, local end-to-end and compile-only API t
 pnpm test:e2e       # HTTPS/CONNECT and 429 recovery end-to-end only
 ```
 
-The end-to-end suite requires `openssl` to generate temporary certificates. It starts loopback-only fixtures on ephemeral test ports and does not contact external portals or paid proxies. It verifies actual tunnel reuse and reconnection, TLS trust on each hop, timeout overrides and 429 queue behavior; it does not claim to verify provider public-IP rotation.
+The end-to-end suite requires `openssl` to generate temporary certificates. It starts loopback-only fixtures on ephemeral test ports and does not contact external portals or paid proxies. It verifies actual tunnel reuse and reconnection, TLS trust on each hop, timeout overrides, 429 queue behavior and 403 half-open recovery; it does not claim to verify provider public-IP rotation.

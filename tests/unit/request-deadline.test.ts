@@ -39,7 +39,8 @@ describe("maxElapsedTime", () => {
         fakeClock();
         const pool = new CallPool({
             baseUrl: "http://localhost",
-            retry: { pauseCodes: [429], delay: 5000 },
+            retry: { delay: 5000 },
+            circuitBreaker: { enabled: true, failureThreshold: 1, halfOpen: { after: 5000 } },
             maxElapsedTime: 1000,
         });
         const send = transport(pool).mockResolvedValueOnce(response(429)).mockResolvedValue(response());
@@ -68,10 +69,11 @@ describe("maxElapsedTime", () => {
         }
     });
 
-    it("rejects the escalated 10s pause immediately instead of spending another attempt per queued job", async () => {
+    it("rejects a second retry wait beyond the remaining budget without draining each queued job through the breaker", async () => {
         const pool = new CallPool({
             baseUrl: "http://localhost",
-            retry: { pauseCodes: [429], delay: 5000 },
+            retry: { delay: 5000 },
+            circuitBreaker: { enabled: true, failureThreshold: 1, halfOpen: { after: 5000 } },
             maxElapsedTime: 7000,
         });
         const send = transport(pool).mockResolvedValue(response(429));
@@ -83,7 +85,7 @@ describe("maxElapsedTime", () => {
             expect(performance.now() - startedAt).toBeLessThan(6500);
             expect(send).toHaveBeenCalledTimes(2);
             expect(pool.getStats()).toMatchObject({ queued: 0, running: 0 });
-            expect(pool.getStats().pausedFor).toBeGreaterThan(9000);
+            expect(pool.getStats().pausedFor).toBeGreaterThan(4000);
         } finally {
             await pool.close();
         }
@@ -159,7 +161,7 @@ describe("maxElapsedTime", () => {
         fakeClock();
         const pool = new CallPool({
             baseUrl: "http://localhost",
-            rateLimit: kind === "quota" ? { quota: { max: 1, window: 5000 } } : { minTime: 5000 },
+            rateLimit: kind === "quota" ? { enabled: true, quota: { max: 1, window: 5000 } } : { enabled: true, minTime: 5000 },
             maxElapsedTime: 1000,
         });
         const send = transport(pool).mockResolvedValue(response());
@@ -179,8 +181,9 @@ describe("maxElapsedTime", () => {
             baseUrl: "http://localhost",
             concurrency: { limit: 2 },
             adaptive: { enabled: true, rateLimitSignal: true },
-            rateLimit: { minTime: 100 },
-            maxElapsedTime: 1000, retry: { maxAttempts: 1, pauseCodes: [429], delay: 5000 },
+            rateLimit: { enabled: true, minTime: 100 },
+            maxElapsedTime: 1000, retry: { maxAttempts: 1 },
+            circuitBreaker: { enabled: true, failureThreshold: 1, halfOpen: { after: 5000 } },
         });
         const send = transport(pool).mockResolvedValue(response(429));
         try {
@@ -201,7 +204,7 @@ describe("maxElapsedTime", () => {
         const controller = new AbortController();
         const pool = new CallPool({
             baseUrl: "http://localhost",
-            rateLimit: { minTime: 500 },
+            rateLimit: { enabled: true, minTime: 500 },
             maxElapsedTime: 1000,
         });
         const send = transport(pool).mockResolvedValue(response());
@@ -223,7 +226,7 @@ describe("maxElapsedTime", () => {
     it("releases deadline resources when the pool closes during a rate wait", async () => {
         fakeClock();
         const controller = new AbortController();
-        const pool = new CallPool({ baseUrl: "http://localhost", rateLimit: { minTime: 500 }, maxElapsedTime: 1000 });
+        const pool = new CallPool({ baseUrl: "http://localhost", rateLimit: { enabled: true, minTime: 500 }, maxElapsedTime: 1000 });
         transport(pool).mockResolvedValue(response());
         try {
             await pool.request("/first");
@@ -241,7 +244,8 @@ describe("maxElapsedTime", () => {
         fakeClock();
         const pool = new CallPool({
             baseUrl: "http://localhost",
-            retry: { pauseCodes: [429], delay: 5000 },
+            retry: { delay: 5000 },
+            circuitBreaker: { enabled: true, failureThreshold: 1, halfOpen: { after: 5000 } },
             maxElapsedTime: 1000,
         });
         transport(pool).mockResolvedValue(response(429));

@@ -12,7 +12,7 @@ describe.concurrent("Quota Enforcement & Rate Limiting", () => {
         const pool = new CallPool({
             baseUrl,
             concurrency: { limit: 3 },
-            rateLimit: { quota: { max: 2, window: 1000 } },
+            rateLimit: { enabled: true, quota: { max: 2, window: 1000 } },
             retry: { maxAttempts: 4, delay: 0 },
         });
         const jobs = Array.from({ length: 3 }, (_, index) => pool.request(`/retry-${index}`));
@@ -47,6 +47,7 @@ describe.concurrent("Quota Enforcement & Rate Limiting", () => {
             const pool = new CallPool({
                 baseUrl,
                 rateLimit: {
+                    enabled: true,
                     quota: { max: 2, window: 2000 },
                 },
             });
@@ -77,6 +78,7 @@ describe.concurrent("Quota Enforcement & Rate Limiting", () => {
             const pool = new CallPool({
                 baseUrl,
                 rateLimit: {
+                    enabled: true,
                     quota: { max: 1, window: 2000 },
                 },
             });
@@ -110,6 +112,7 @@ describe.concurrent("Quota Enforcement & Rate Limiting", () => {
             const pool = new CallPool({
                 baseUrl,
                 rateLimit: {
+                    enabled: true,
                     minTime: "auto",
                     quota: { max: 3, window: 3000 },
                 },

@@ -11,7 +11,9 @@ new CallPool({
     baseUrl: "https://example.com",
     maxElapsedTime: 5000,
     defaultHeaders: { "x-target": "value" },
-    retry: { codes: [408, 429, "5xx"] as const, pauseCodes: [429], maxDelay: 10000, networkErrors: false },
+    circuitBreaker: { enabled: true, codes: [403, 429, 503], failureThreshold: 3, halfOpen: { after: 10000, maxRetryAfter: 60000, maxConcurrent: 1, successThreshold: 2 } },
+    rateLimit: { enabled: false },
+    retry: { codes: [408, 429, "5xx"] as const, maxDelay: 10000, networkErrors: false },
     network: { uri: "http://proxy.example.com", pipelining: 0, headersTimeout: 1000, requestTls: { ca: "pem" }, proxyTls: { servername: "proxy.example.com" } },
 });
 const overrides: RequestOptions = { maxElapsedTime: 1000, reset: true, headersTimeout: 0, bodyTimeout: 500 };
@@ -23,7 +25,12 @@ const oldProxy: CallPoolOptions = { baseUrl: "http://example.com", network: { pr
 const oldHeaders: CallPoolOptions = { baseUrl: "http://example.com", network: { defaultHeaders: {} } };
 // @ts-expect-error Total budget belongs at root/request level.
 const oldDeadline: CallPoolOptions = { baseUrl: "http://example.com", retry: { maxElapsedTime: 1000 } };
-// @ts-expect-error Pauses belong to the retry policy.
+// @ts-expect-error Shared failure protection belongs to circuitBreaker.
 const oldPause: CallPoolOptions = { baseUrl: "http://example.com", adaptive: { rateLimitSignal: { pause: true } } };
 // @ts-expect-error Only 4xx/5xx family selectors are supported.
 const badCodes: CallPoolOptions = { baseUrl: "http://example.com", retry: { codes: ["3xx"] } };
+
+// @ts-expect-error The draft pauseCodes option was replaced by circuitBreaker.
+const oldPauseCodes: CallPoolOptions = { baseUrl: "http://example.com", retry: { pauseCodes: [429] } };
+// @ts-expect-error Circuit breakers always wait; no onOpen switch.
+const unsupportedOnOpen: CallPoolOptions = { baseUrl: "http://example.com", circuitBreaker: { onOpen: "reject" } };

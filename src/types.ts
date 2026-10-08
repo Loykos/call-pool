@@ -1,6 +1,6 @@
 import type { Dispatcher, Pool, ProxyAgent } from "undici";
 
-/** HTTP failures eligible for a retry or a shared pause. */
+/** HTTP failures eligible for retry or circuit breaking. */
 export type StatusCodeSelector = number | "4xx" | "5xx";
 
 /** Native constructor options. `uri` selects Undici ProxyAgent instead of Pool. */
@@ -17,6 +17,8 @@ export interface CallPoolOptions {
 
     /** Static Configuration (Contractual Rate Limit) */
     rateLimit?: {
+        /** Apply spacing and quota. Default: false */
+        enabled?: boolean;
         /** Minimum time between requests. If "auto", requires `quota`. */
         minTime?: number | "auto";
         /** Defined quota (e.g. 100 req / 60000ms) */
@@ -80,7 +82,7 @@ export interface CallPoolOptions {
 
         /**
          * Reduces concurrency on 429 and holds recovery for successful responses.
-         * Requires adaptive.enabled. Does not pause the pool: use retry.pauseCodes.
+         * Requires adaptive.enabled. Does not pause the pool: use circuitBreaker.
          * Default: false; true uses RateLimitSignalOptions defaults.
          */
         rateLimitSignal?: boolean | RateLimitSignalOptions;
@@ -98,26 +100,48 @@ export interface CallPoolOptions {
     retry?: {
         /** Total HTTP attempts including the first. Default: 3 */
         maxAttempts?: number;
-        /** Replaces the default [408, 429, "5xx"]. [] disables HTTP retries. */
+        /** Replaces the default [403, 408, 429, "5xx"]. [] disables HTTP retries. */
         codes?: readonly StatusCodeSelector[];
-        /** Independent of codes. Holds all new attempts, even after a final failure. Default: [] */
-        pauseCodes?: readonly StatusCodeSelector[];
         /** Retry transport failures (never cancellation or invalid arguments). Default: true */
         networkErrors?: boolean;
         /** Initial fallback wait in ms when Retry-After is absent/invalid. Default: 1000 */
         delay?: number;
-        /** Fallback multiplier per retry / shared pause episode. Default: 2 */
+        /** Fallback multiplier per retry. Default: 2 */
         factor?: number;
-        /** Maximum fallback wait in ms, for retries and pauses. Default: 60000 */
+        /** Maximum fallback wait in ms, for retries. Default: 60000 */
         maxDelay?: number;
         /** Maximum wait in ms honored from a valid Retry-After. Default: 60000 */
         maxRetryAfter?: number;
     };
 
+    /** Pool-wide HTTP failure protection; open circuits retain waiting work. */
+    circuitBreaker?: CircuitBreakerOptions;
+
     /** Native Undici Pool.Options or ProxyAgent.Options, overriding pool defaults.
      * Request-specific options belong in request(). Proxy headers are proxy-only.
      */
     network?: NetworkOptions;
+}
+
+export type CircuitBreakerState = "disabled" | "closed" | "open" | "half-open";
+
+export interface CircuitBreakerOptions {
+    /** Default: false. Waiting never consumes HTTP attempts. */
+    enabled?: boolean;
+    /** Replaces [403, 429, 503]. Independent of retry.codes; overlap is allowed. */
+    codes?: readonly StatusCodeSelector[];
+    /** Consecutive matching HTTP failures across attempts in the pool. Default: 3 */
+    failureThreshold?: number;
+    halfOpen?: {
+        /** Wait in ms before probes when Retry-After is missing/invalid. Default: 10000 */
+        after?: number;
+        /** Independent cap for the server's Retry-After wait in ms. Default: 60000 */
+        maxRetryAfter?: number;
+        /** Maximum simultaneous probe attempts. Default: 1 */
+        maxConcurrent?: number;
+        /** Completed successful probes required to close the circuit. Default: 2 */
+        successThreshold?: number;
+    };
 }
 
 /**
@@ -219,6 +243,8 @@ export interface CallPoolStats {
     running: number;
     /** Current concurrency limit (dynamically tuned when adaptive is enabled) */
     concurrency: number;
-    /** Milliseconds left before new attempts may start after a matching `retry.pauseCodes` response, 0 otherwise */
+    /** Current circuit state, or disabled when not enabled. */
+    circuitBreaker: CircuitBreakerState;
+    /** Milliseconds before an open circuit admits probes; 0 in other states. */
     pausedFor: number;
 }

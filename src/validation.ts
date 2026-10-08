@@ -30,6 +30,7 @@ export function validateOptions(options: CallPoolOptions): void {
     validateRateLimitOptions(options.rateLimit);
     validateRetryOptions(options.retry);
     validateAdaptiveOptions(options.adaptive, concurrencyLimit);
+    validateCircuitBreaker(options.circuitBreaker);
 }
 
 export function validateMaxElapsedTime(value: number | undefined): void {
@@ -47,6 +48,9 @@ function validateCodes(codes: readonly StatusCodeSelector[] | undefined, field: 
 }
 
 function validateRateLimitOptions(rateLimit: CallPoolOptions["rateLimit"]): void {
+    if (rateLimit?.enabled !== undefined && typeof rateLimit.enabled !== "boolean") {
+        throw new Error("[CallPool] 'rateLimit.enabled' must be a boolean");
+    }
     const quota = rateLimit?.quota;
     if (quota) {
         if (!Number.isInteger(quota.max) || quota.max < 1) {
@@ -86,7 +90,9 @@ function validateRetryOptions(retry: CallPoolOptions["retry"]): void {
         throw new Error("[CallPool] 'retry.networkErrors' must be a boolean");
     }
     validateCodes(retry?.codes, "retry.codes");
-    validateCodes(retry?.pauseCodes, "retry.pauseCodes");
+    if (retry && "pauseCodes" in retry) {
+        throw new Error("[CallPool] 'retry.pauseCodes' was replaced by 'circuitBreaker'");
+    }
 }
 
 function validateAdaptiveOptions(adaptive: CallPoolOptions["adaptive"], concurrencyLimit: number): void {
@@ -139,9 +145,35 @@ function validateRateLimitSignal(signal: NonNullable<CallPoolOptions["adaptive"]
         throw new Error("[CallPool] 'adaptive.rateLimitSignal.decreaseFactor' must be greater than 0 and less than 1");
     }
     if ("pause" in signal) {
-        throw new Error("[CallPool] 'adaptive.rateLimitSignal.pause' moved to 'retry.pauseCodes'");
+        throw new Error("[CallPool] 'adaptive.rateLimitSignal.pause' was replaced by 'circuitBreaker'");
     }
     if (recoveryAfter !== undefined && (!Number.isInteger(recoveryAfter) || recoveryAfter < 0)) {
         throw new Error("[CallPool] 'adaptive.rateLimitSignal.recoveryAfter' must be a non-negative integer");
+    }
+}
+
+function validateCircuitBreaker(value: CallPoolOptions["circuitBreaker"]): void {
+    if (value === undefined) return;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error("[CallPool] 'circuitBreaker' must be an object");
+    }
+    if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+        throw new Error("[CallPool] 'circuitBreaker.enabled' must be a boolean");
+    }
+    if ("onOpen" in value) throw new Error("[CallPool] 'circuitBreaker.onOpen' is not supported; open circuits always wait");
+    validateCodes(value.codes, "circuitBreaker.codes");
+    const halfOpen = value.halfOpen;
+    if (halfOpen !== undefined && (typeof halfOpen !== "object" || halfOpen === null || Array.isArray(halfOpen))) {
+        throw new Error("[CallPool] 'circuitBreaker.halfOpen' must be an object");
+    }
+    for (const [field, number] of [["failureThreshold", value.failureThreshold], ["halfOpen.maxConcurrent", halfOpen?.maxConcurrent], ["halfOpen.successThreshold", halfOpen?.successThreshold]] as const) {
+        if (number !== undefined && (!Number.isInteger(number) || number < 1)) {
+            throw new Error(`[CallPool] 'circuitBreaker.${field}' must be a positive integer`);
+        }
+    }
+    for (const [field, number] of [["after", halfOpen?.after], ["maxRetryAfter", halfOpen?.maxRetryAfter]] as const) {
+        if (number !== undefined && (!Number.isFinite(number) || number < 0)) {
+            throw new Error(`[CallPool] 'circuitBreaker.halfOpen.${field}' must be a non-negative finite number`);
+        }
     }
 }

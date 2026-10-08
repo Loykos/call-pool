@@ -11,7 +11,7 @@ describe.concurrent("Rate Limiting", () => {
             // 400ms di attesa tra una richiesta e l'altra
             const pool = new CallPool({
                 baseUrl,
-                rateLimit: { minTime: 400 },
+                rateLimit: { enabled: true, minTime: 400 },
             });
 
             try {
@@ -36,7 +36,7 @@ describe.concurrent("Rate Limiting", () => {
             const baseUrl = await mockServer.start();
             const pool = new CallPool({
                 baseUrl,
-                rateLimit: { minTime: 0 },
+                rateLimit: { enabled: true, minTime: 0 },
             });
 
             try {
@@ -62,6 +62,7 @@ describe.concurrent("Rate Limiting", () => {
             const pool = new CallPool({
                 baseUrl,
                 rateLimit: {
+                    enabled: true,
                     minTime: "auto",
                     quota: { max: 2, window: 2000 },
                 },
@@ -86,7 +87,7 @@ describe.concurrent("Rate Limiting", () => {
             expect(() => {
                 new CallPool({
                     baseUrl: "http://localhost",
-                    rateLimit: { minTime: "auto" },
+                    rateLimit: { enabled: true, minTime: "auto" },
                     // Manca la quota!
                 });
             }).toThrow(/requires 'quota'/g);
@@ -101,7 +102,7 @@ describe.concurrent("Rate Limiting", () => {
             // 300ms di intervallo
             const pool = new CallPool({
                 baseUrl,
-                rateLimit: { minTime: 300 },
+                rateLimit: { enabled: true, minTime: 300 },
             });
 
             try {

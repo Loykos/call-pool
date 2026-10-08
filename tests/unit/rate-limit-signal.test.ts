@@ -69,7 +69,8 @@ describe("adaptive.rateLimitSignal", () => {
             baseUrl,
             concurrency: { limit: 4 },
             adaptive: { enabled: true, rateLimitSignal: true },
-            retry: { pauseCodes: [429], delay: 5000, maxAttempts: 2 },
+            circuitBreaker: { enabled: true, failureThreshold: 1, halfOpen: { after: 5000 } },
+            retry: { delay: 5000, maxAttempts: 2 },
         });
         try {
             const first = pool.request("/refused");
@@ -87,14 +88,15 @@ describe("adaptive.rateLimitSignal", () => {
         }
     }, 10_000);
 
-    it("doubles the pause when a server that names no wait refuses again before recovery", async () => {
+    it("coordinates retry backoff with a fixed circuit cooldown on repeated refusals", async () => {
         // No Retry-After: the configured fallback doubles on repeated refusals.
         const { server, baseUrl, arrivals } = await rateLimitedServer(2, "", 5);
         const pool = new CallPool({
             baseUrl,
             concurrency: { limit: 2 },
             adaptive: { enabled: true, rateLimitSignal: true },
-            retry: { pauseCodes: [429], delay: 100, maxAttempts: 3 },
+            circuitBreaker: { enabled: true, failureThreshold: 1, halfOpen: { after: 100 } },
+            retry: { delay: 100, maxAttempts: 3 },
         });
         try {
             await pool.request("/refused-twice");
@@ -113,7 +115,8 @@ describe("adaptive.rateLimitSignal", () => {
             baseUrl,
             concurrency: { limit: 2 },
             adaptive: { enabled: true, rateLimitSignal: true },
-            retry: { pauseCodes: [429], delay: 100, maxAttempts: 3 },
+            circuitBreaker: { enabled: true, failureThreshold: 1, halfOpen: { after: 100 } },
+            retry: { delay: 100, maxAttempts: 3 },
         });
         try {
             await pool.request("/refused-twice");

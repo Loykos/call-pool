@@ -19,7 +19,7 @@ function createScheduler(options: ConstructorParameters<typeof CallPool>[0] = { 
 }
 
 function createRateGate(rateLimit: NonNullable<ConstructorParameters<typeof CallPool>[0]["rateLimit"]>) {
-    const pool = new CallPool({ baseUrl: "http://localhost", rateLimit });
+    const pool = new CallPool({ baseUrl: "http://localhost", rateLimit: { ...rateLimit, enabled: true } });
     const rateGate = (pool as unknown as { rateGate: RateGateHarness }).rateGate;
     return { pool, rateGate };
 }
