@@ -2,6 +2,14 @@ import { describe, it, expect } from "vitest";
 import { CallPool } from "../../src/index";
 import { MockServer } from "../setup/mock-server";
 
+function rawHeaderValues(rawHeaders: string[], name: string): string[] {
+    const values: string[] = [];
+    for (let index = 0; index < rawHeaders.length; index += 2) {
+        if (rawHeaders[index].toLowerCase() === name) values.push(rawHeaders[index + 1]);
+    }
+    return values;
+}
+
 describe.concurrent("Request Basic", () => {
     describe("HTTP Methods & Basics", () => {
         it("should make a standard GET request and parse response", async () => {
@@ -105,6 +113,56 @@ describe.concurrent("Request Basic", () => {
     });
 
     describe("Headers Management", () => {
+        it.each([
+            ["Authorization", "authorization"],
+            ["authorization", "AUTHORIZATION"],
+        ])("should override %s with %s without sending duplicate headers", async (defaultName, requestName) => {
+            const rawRequests: string[][] = [];
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({ onRequestStart: req => rawRequests.push([...req.rawHeaders]) });
+            const defaultHeaders = Object.freeze({ [defaultName]: "Bearer default", "Content-Type": "text/plain", "X-Default": "keep" });
+            const requestHeaders = Object.freeze({ [requestName]: "Bearer request", "content-type": "application/vnd.api+json" });
+            const pool = new CallPool({ baseUrl, network: { defaultHeaders } });
+
+            try {
+                await pool.request("/override", { method: "POST", body: { ok: true }, headers: requestHeaders });
+                await pool.request("/defaults");
+
+                expect(rawHeaderValues(rawRequests[0], "authorization")).toEqual(["Bearer request"]);
+                expect(rawHeaderValues(rawRequests[0], "content-type")).toEqual(["application/vnd.api+json"]);
+                expect(rawHeaderValues(rawRequests[0], "x-default")).toEqual(["keep"]);
+                // Overrides must neither mutate caller-owned objects nor leak into later requests.
+                expect(rawHeaderValues(rawRequests[1], "authorization")).toEqual(["Bearer default"]);
+                expect(rawHeaderValues(rawRequests[1], "content-type")).toEqual(["text/plain"]);
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
+        it("should deduplicate each header source before applying request overrides", async () => {
+            const rawRequests: string[][] = [];
+            const mockServer = new MockServer();
+            const baseUrl = await mockServer.start({ onRequestStart: req => rawRequests.push([...req.rawHeaders]) });
+            const pool = new CallPool({
+                baseUrl,
+                network: { defaultHeaders: { Authorization: "Bearer first", authorization: "Bearer last", "X-Mode": "default" } },
+            });
+
+            try {
+                await pool.request("/override", {
+                    headers: { Authorization: "Bearer request", "X-Mode": "first", "x-mode": "last" },
+                });
+                await pool.request("/defaults");
+
+                expect(rawHeaderValues(rawRequests[0], "authorization")).toEqual(["Bearer request"]);
+                expect(rawHeaderValues(rawRequests[0], "x-mode")).toEqual(["last"]);
+                expect(rawHeaderValues(rawRequests[1], "authorization")).toEqual(["Bearer last"]);
+                expect(rawHeaderValues(rawRequests[1], "x-mode")).toEqual(["default"]);
+            } finally {
+                await Promise.all([pool.close(), mockServer.stop()]);
+            }
+        });
+
         it("should merge and override headers correctly", async () => {
             const mockServer = new MockServer();
             const baseUrl = await mockServer.start();

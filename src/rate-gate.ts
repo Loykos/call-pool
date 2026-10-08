@@ -4,6 +4,7 @@ import { PoolClosedError } from "./errors.js";
 interface RateWaiter {
     resolve: () => void;
     reject: (reason: unknown) => void;
+    cleanupAbort?: () => void;
 }
 
 const RATE_QUEUE_COMPACT_AT = 1024;
@@ -23,6 +24,7 @@ export class RateGate {
     private tokens: number;
     private windowIndex = 0;
     private lastStartAt = -Infinity;
+    private pausedUntil = -Infinity;
     private wakeTimer: NodeJS.Timeout | null = null;
     private stopped = false;
 
@@ -32,12 +34,41 @@ export class RateGate {
         this.tokens = this.quota?.max ?? Infinity;
     }
 
-    acquire(): Promise<void> {
+    acquire(signal?: AbortSignal): Promise<void> {
         if (this.stopped) return Promise.reject(new PoolClosedError());
+        if (signal?.aborted) return Promise.reject(signal.reason);
         return new Promise<void>((resolve, reject) => {
-            this.waiters.push({ resolve, reject });
+            const waiter: RateWaiter = { resolve, reject };
+            const entry = this.waiters.push(waiter);
+            if (signal) {
+                const onAbort = () => {
+                    if (!this.waiters.remove(entry)) return;
+                    waiter.cleanupAbort?.();
+                    if (this.waiters.size === 0) this.clearWakeTimer();
+                    reject(signal.reason);
+                };
+                waiter.cleanupAbort = () => signal.removeEventListener("abort", onAbort);
+                signal.addEventListener("abort", onAbort, { once: true });
+            }
             this.dispatch();
         });
+    }
+
+    /**
+     * Holds every attempt not yet started until `until` (a `performance.now()`
+     * timestamp). A pause only ever extends: an earlier deadline is ignored.
+     */
+    pauseUntil(until: number): void {
+        if (this.stopped || until <= this.pausedUntil) return;
+        this.pausedUntil = until;
+        // A pending wake was computed without the pause: start over from now.
+        this.clearWakeTimer();
+        this.dispatch();
+    }
+
+    /** Milliseconds left in the current pause, 0 when not paused. */
+    pausedFor(now: number = performance.now()): number {
+        return Math.max(0, this.pausedUntil - now);
     }
 
     stop(): void {
@@ -46,7 +77,10 @@ export class RateGate {
         this.clearWakeTimer();
 
         const closed = new PoolClosedError();
-        this.waiters.clear(waiter => waiter.reject(closed));
+        this.waiters.clear(waiter => {
+            waiter.cleanupAbort?.();
+            waiter.reject(closed);
+        });
     }
 
     private dispatch(): void {
@@ -56,6 +90,7 @@ export class RateGate {
 
             const waiter = this.waiters.take();
             if (!waiter) return;
+            waiter.cleanupAbort?.();
             this.lastStartAt = performance.now();
             this.tokens--;
             waiter.resolve();
@@ -64,7 +99,7 @@ export class RateGate {
 
     private startDelay(now: number): number {
         const spacingWait = this.lastStartAt + this.minTime - now;
-        return Math.max(spacingWait, this.quotaWait(now), 0);
+        return Math.max(spacingWait, this.quotaWait(now), this.pausedUntil - now, 0);
     }
 
     private quotaWait(now: number): number {

@@ -5,6 +5,7 @@ interface ScheduledJob {
     task: () => Promise<unknown>;
     resolve: (value: unknown) => void;
     reject: (reason: unknown) => void;
+    cleanupAbort?: () => void;
 }
 
 const PRIORITY_LEVELS = 10;
@@ -39,10 +40,22 @@ export class RequestScheduler {
         return this.runningCount;
     }
 
-    schedule<T>(priority: number, task: () => Promise<T>): Promise<T> {
+    schedule<T>(priority: number, task: () => Promise<T>, signal?: AbortSignal): Promise<T> {
         if (this.stopped) return Promise.reject(new PoolClosedError());
+        if (signal?.aborted) return Promise.reject(signal.reason);
         return new Promise<T>((resolve, reject) => {
-            this.queues[priority].push({ task, resolve: resolve as (value: unknown) => void, reject });
+            const job: ScheduledJob = { task, resolve: resolve as (value: unknown) => void, reject };
+            const queue = this.queues[priority];
+            const entry = queue.push(job);
+            if (signal) {
+                const onAbort = () => {
+                    if (!queue.remove(entry)) return;
+                    job.cleanupAbort?.();
+                    reject(signal.reason);
+                };
+                job.cleanupAbort = () => signal.removeEventListener("abort", onAbort);
+                signal.addEventListener("abort", onAbort, { once: true });
+            }
             this.dispatch();
         });
     }
@@ -58,7 +71,10 @@ export class RequestScheduler {
 
         const closed = new PoolClosedError();
         for (const bucket of this.queues) {
-            bucket.clear(job => job.reject(closed));
+            bucket.clear(job => {
+                job.cleanupAbort?.();
+                job.reject(closed);
+            });
         }
 
         if (this.runningCount === 0) return Promise.resolve();
@@ -80,7 +96,13 @@ export class RequestScheduler {
     private takeNext(): ScheduledJob | undefined {
         for (const bucket of this.queues) {
             const job = bucket.take();
-            if (job) return job;
+            if (job) {
+                // Once started, the task owns cancellation and releases its
+                // concurrency slot only when transport/backoff has settled.
+                job.cleanupAbort?.();
+                job.cleanupAbort = undefined;
+                return job;
+            }
         }
         return undefined;
     }

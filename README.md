@@ -124,7 +124,7 @@ const pool = new CallPool({
 });
 
 // Usage examples
-// JSON parsing is automatic when Content-Type is application/json
+// JSON parsing is automatic for application/json and media types ending in +json
 const users = await pool.request<User[]>("/users");
 
 const newUser = await pool.request<User>("/users", {
@@ -179,6 +179,10 @@ await pool.close();
 | `adaptive.decreaseFactor` | `number`  | No       | `0.9`   | Multiplicative decrease factor applied during congestion. Must be greater than 0 and less than 1                  |
 | `adaptive.minConcurrency` | `number`  | No       | `1`     | Lower bound for adaptive concurrency. Cannot exceed `concurrency.limit`                                           |
 | `adaptive.initialConcurrency` | `number` | No    | `concurrency.limit` | Starting concurrency for the adaptive algorithm (slow-start). Must be between `minConcurrency` and `concurrency.limit` |
+| `adaptive.rateLimitSignal` | `boolean \| object` | No | `false` | Treats a 429 as a pool-wide signal (see [Rate-limit signal](#rate-limit-signal)). `true` uses the defaults below |
+| `adaptive.rateLimitSignal.decreaseFactor` | `number` | No | `0.5` | Multiplicative concurrency cut applied once per rate-limit episode. Must be greater than 0 and less than 1 |
+| `adaptive.rateLimitSignal.pause` | `boolean` | No | `true` | Holds every new attempt of the pool until the episode's `Retry-After` is over |
+| `adaptive.rateLimitSignal.recoveryAfter` | `number` | No | `10` | Successful responses required after the last 429 before concurrency may grow again |
 
 ### Retry Configuration
 
@@ -263,7 +267,9 @@ const mtlsPool = new CallPool({
 
 Options for individual requests passed to the `request()` method.
 
-**Note**: Response parsing is automatic. If `Content-Type` contains `application/json`, the body is parsed as JSON. Textual media types and responses without `Content-Type` return a string; binary media types return a byte-preserving `Buffer`. Request bodies that are JavaScript objects are automatically serialized to JSON with the appropriate `Content-Type` header.
+**Note**: Response parsing is automatic. The media type in `Content-Type` is matched case-insensitively, ignoring parameters such as `charset`. `application/json` and types ending in `+json` (such as `application/vnd.api+json`) are parsed as JSON. Textual media types and responses without `Content-Type` return a string; binary media types return a byte-preserving `Buffer`. Request bodies that are JavaScript objects are automatically serialized to JSON with the appropriate `Content-Type` header.
+
+Empty responses to `HEAD`, or with status `204`, `205`, or `304`, resolve with `undefined` (also as `body` in raw mode). With `binary: true`, they resolve with an empty `Buffer`. Other empty or malformed JSON responses still reject with a non-retryable `CallPoolError`. Use `request<void>()` when no content is expected, or include `undefined` in the body type when an endpoint can return either content or no content. HTTP errors still reject, including on `HEAD` requests.
 
 **Fetching files**: a server that omits `Content-Type`, or labels a picture as text, would have its body decoded as UTF-8 and its bytes lost. Pass `binary: true` when you know you are downloading a file — the response then resolves as a `Buffer` whatever the header says, and JSON parsing is skipped. Error bodies stay textual, so a failure message is still readable.
 
@@ -294,7 +300,7 @@ const result = await pool.request("/users", {
 });
 
 // PUT request
-// Response JSON is automatically parsed when Content-Type is application/json
+// Response JSON is automatically parsed for application/json and +json media types
 await pool.request("/users/123", {
     method: "PUT",
     body: { name: "Jane" },
@@ -349,8 +355,11 @@ const newUser = await pool.request<User>("/users", {
 | `priority`      | `number`                                           | No       | `5`      | Queue priority (0-9, lower numbers run first; 0 is highest)     |
 | `body`          | `string \| Buffer \| Uint8Array \| object \| null` | No       | -        | Request body (JS objects are automatically serialized to JSON)  |
 | `headers`       | `Record<string, string>`                           | No       | -        | Additional headers for the single request                       |
+| `signal`        | `AbortSignal \| null`                              | No       | -        | Cancels queued work, quota/minTime waits, HTTP and retries        |
 | `response`      | `"body" \| "raw"`                                  | No       | `"body"` | `"raw"` resolves with a `{ status, headers, body }` envelope    |
 | `exposeCookies` | `boolean`                                          | No       | `false`  | Reveals `Set-Cookie` in the raw envelope (redacted by default)  |
+
+Header names are matched case-insensitively: request headers override `network.defaultHeaders`, so `authorization` replaces a default `Authorization`. If the same name appears with different casing within either object, the last entry wins. Each header name is sent once, and the input objects are left untouched.
 
 Every other [undici `RequestOptions`](https://github.com/nodejs/undici/blob/main/docs/docs/api/Dispatcher.md#parameter-requestoptions) field (`query`, `maxRedirections`, `idempotent`, `headersTimeout`, ...) is passed through 1:1, except `throwOnError`, which is excluded because it would bypass the pool's error and retry policy.
 
@@ -368,6 +377,8 @@ if (res.status === 302) {
     const next = res.headers["location"];
 }
 ```
+
+When options are held in a variable typed as `RequestOptions`, `request<T>()` returns `Promise<T | CallPoolResponse<T>>` because `response` can be either mode. Literal `response: "raw"` still returns `Promise<CallPoolResponse<T>>`; literal `"body"` or omitted options return `Promise<T>`.
 
 `Set-Cookie` is redacted everywhere by default so session cookies can't leak through logged responses or errors. When the cookie **is** the data (e.g. session bootstrap), opt in per request:
 
@@ -388,19 +399,53 @@ When enabled, the pool automatically monitors request latency and slows down whe
 -   If requests are slower than the average multiplied by `adaptive.congestionRatio` for `adaptive.breachLimit` consecutive samples, it reduces concurrency
 -   When requests become fast again, it restores concurrency gradually
 
+With `adaptive.useTTFB: true` (the default), the controller receives the latency sample as soon as non-error response headers arrive, so scheduling can adapt while the body is still downloading. With `false`, the sample is recorded after the complete body download, before parsing. Each attempt contributes at most one sample; 4xx/5xx responses are excluded. In TTFB mode, a recorded sample is retained even if the subsequent body download fails.
+
+Requests keep their concurrency slot until they finish, including body consumption and retries. Scheduler updates retain the existing 250 ms tuning interval.
+
+### Rate-limit signal
+
+The latency controller samples successful responses only, so on its own it never sees a 429: the refused request waits its `Retry-After`, and the other slots keep sending at full concurrency. With `adaptive.rateLimitSignal` a 429 steers the whole pool instead:
+
+-   **One cut per episode**: concurrency is multiplied by `decreaseFactor` (never below `minConcurrency`, always at least one slot) and applied at once, without the tuning debounce. Every 429 received before the episode's wait is over extends it without cutting again, so the requests already in flight when the server starts refusing do not drive concurrency to its floor together.
+-   **Pause** (`pause: true`): no new HTTP attempt starts — first attempts and retries alike — until the wait the server asked for is over (`Retry-After`, capped at `retry.maxRetryAfter`; 5s when the header is missing). `getStats().pausedFor` reports the time left.
+-   **Recovery hold**: after the last 429 the controller may grow concurrency again only after `recoveryAfter` successful responses; until then the fast responses that would normally signal headroom do not.
+
+The option requires `adaptive.enabled`; it is ignored otherwise.
+
+```typescript
+const pool = new CallPool({
+    baseUrl: "https://portal.example.com",
+    concurrency: { limit: 10 },
+    adaptive: { enabled: true, minConcurrency: 1, rateLimitSignal: { decreaseFactor: 0.5, recoveryAfter: 20 } },
+});
+```
+
 ## Introspection
 
 -   `pool.getCurrentConcurrency()`: current concurrency limit (the live adaptive value when adaptive throttling is enabled)
--   `pool.getStats()`: live snapshot of the pool — `{ queued, running, concurrency }`
+-   `pool.getStats()`: live snapshot of the pool — `{ queued, running, concurrency, pausedFor }`
 
 ## Error Handling
 
--   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits exactly that long (capped at `retry.maxRetryAfter`, default 60s) before retrying — no extra backoff is stacked on top
+-   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits exactly that long (capped at `retry.maxRetryAfter`, default 60s) before retrying — no extra backoff is stacked on top. With `adaptive.rateLimitSignal` the 429 also cuts the pool's concurrency and pauses its other requests (see [Rate-limit signal](#rate-limit-signal))
 -   **5xx (Server Error) and 408 (Request Timeout)**: Automatic retry with exponential backoff
 -   **Other 4xx (Client Error)**: No retry is performed
 -   **Network Error**: Automatic retry with exponential backoff
 -   **Invalid local request arguments**: Propagated immediately without retry
--   **AbortSignal**: Pass a `signal` in the request options to cancel a request; an aborted request is never retried, and pending retry waits resolve immediately
+-   **AbortSignal**: Pass an optional `signal` to cancel a logical request, including scheduler queue, quota/`minTime` waits, HTTP/body download, and retry backoff. The rejection preserves `signal.reason`, and an aborted request is never retried. Cancelling while queued removes the job promptly; cancelling while waiting for rate permission releases its concurrency slot without charging that pending permission. An active HTTP attempt keeps its slot until the transport settles. Abort listeners and unused rate wake timers are removed when their waits end.
+
+```typescript
+const controller = new AbortController();
+const pending = pool.request("/report", { signal: controller.signal });
+controller.abort(new Error("Report no longer needed"));
+
+try {
+    await pending;
+} catch (error) {
+    if (error !== controller.signal.reason) throw error;
+}
+```
 
 HTTP-level failures are thrown as `CallPoolError`, which exposes the response details:
 

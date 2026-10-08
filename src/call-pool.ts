@@ -1,6 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { Pool, ProxyAgent, errors } from "undici";
-import { CallPoolOptions, CallPoolResponse, CallPoolStats, CallPoolTlsOptions, RequestOptions } from "./types.js";
+import { CallPoolOptions, CallPoolResponse, CallPoolStats, CallPoolTlsOptions, RateLimitSignalOptions, RequestOptions } from "./types.js";
 import { CallPoolError, PoolClosedError } from "./errors.js";
 import { RateGate } from "./rate-gate.js";
 import { RequestScheduler } from "./scheduler.js";
@@ -8,6 +8,8 @@ import { validateOptions } from "./validation.js";
 
 /** Per-request options left after the pool-level keys are extracted. */
 type TransportOptions = Omit<RequestOptions, "priority" | "response" | "exposeCookies">;
+
+const RATE_LIMIT_SIGNAL_DEFAULTS: Required<RateLimitSignalOptions> = { decreaseFactor: 0.5, pause: true, recoveryAfter: 10 };
 
 export class CallPool {
     private client: Pool | ProxyAgent;
@@ -33,6 +35,9 @@ export class CallPool {
     private increaseStep: number;
     private decreaseFactor: number;
 
+    // Rate-limit signal (adaptive only): null when 429s stay per-request
+    private rateLimitSignal: Required<RateLimitSignalOptions> | null;
+
     // Adaptive Bounds
     private minConcurrency: number;
     private maxConcurrency: number; // Initialized to concurrency.limit
@@ -46,6 +51,10 @@ export class CallPool {
     private pendingUpdateTimer: NodeJS.Timeout | null = null;
     private avgLatency: number = 0;
     private congestionHits: number = 0;
+    /** End of the current rate-limit episode (performance.now() timebase) */
+    private rateLimitedUntil: number = -Infinity;
+    /** Successes still required after the last 429 before concurrency may grow */
+    private rateLimitHold: number = 0;
 
     // Limiter State
     private currentConcurrency: number;
@@ -74,6 +83,7 @@ export class CallPool {
         this.breachLimit = adaptOpts?.breachLimit ?? 2;
         this.increaseStep = adaptOpts?.increaseStep ?? 1;
         this.decreaseFactor = adaptOpts?.decreaseFactor ?? 0.9;
+        this.rateLimitSignal = this.resolveRateLimitSignal(adaptOpts);
 
         // Adaptive Bounds Setup (validation guarantees 1 <= minConcurrency <= limit)
         this.minConcurrency = adaptOpts?.minConcurrency ?? 1;
@@ -97,7 +107,16 @@ export class CallPool {
         this.client = this.createClient(options.baseUrl, concurrencyLimit, options.network?.tls, options.network?.proxy);
         this.scheduler = new RequestScheduler({ maxConcurrent: this.currentConcurrency });
         const minTime = this.computeBaseMinTime(rateOpts);
-        this.rateGate = minTime > 0 || rateOpts?.quota ? new RateGate({ minTime, quota: rateOpts?.quota }) : null;
+        // The pause of a rate-limit episode is enforced by the gate, so it is
+        // created even for a pool without contractual limits.
+        const needsGate = minTime > 0 || rateOpts?.quota || this.rateLimitSignal?.pause;
+        this.rateGate = needsGate ? new RateGate({ minTime, quota: rateOpts?.quota }) : null;
+    }
+
+    private resolveRateLimitSignal(adaptOpts: CallPoolOptions["adaptive"]): Required<RateLimitSignalOptions> | null {
+        const signal = adaptOpts?.rateLimitSignal;
+        if (!this.adaptiveEnabled || !signal) return null;
+        return { ...RATE_LIMIT_SIGNAL_DEFAULTS, ...(signal === true ? {} : signal) };
     }
 
     private computeBaseMinTime(rateOpts: CallPoolOptions["rateLimit"]): number {
@@ -144,8 +163,10 @@ export class CallPool {
      * automatic retries on transient failures.
      *
      * Resolves with the response body parsed as JSON when the response's
-     * `Content-Type` is `application/json`, as a string for textual content, or
-     * as a byte-preserving Buffer for binary content.
+     * `Content-Type` is `application/json` or has a `+json` suffix (case-insensitive),
+     * as a string for textual content, or as a byte-preserving Buffer for binary
+     * content. Empty HEAD/204/205/304 responses resolve with undefined unless
+     * `binary: true` requests an empty Buffer.
      * HTTP failures (4xx/5xx) reject with {@link CallPoolError}; retryable failures
      * (429, 408, 5xx) are retried up to `retry.maxAttempts`, honoring a capped
      * `Retry-After` wait on 429s. Network-level errors (DNS, connection reset,
@@ -153,7 +174,7 @@ export class CallPool {
      *
      * @param path - Request path, appended to `baseUrl`.
      * @param options - Per-request overrides. `signal` aborts the request, including
-     * any pending retry wait. `priority` (0-9, default 5) sets scheduling order in
+     * queue, quota/minTime and retry waits. `priority` (0-9, default 5) sets scheduling order in
      * the limiter's queue; lower values run first. `response: "raw"` resolves with a
      * `{ status, headers, body }` envelope instead of the bare body, with the same
      * error/retry semantics; `exposeCookies` additionally reveals Set-Cookie there.
@@ -164,12 +185,14 @@ export class CallPool {
      */
     public async request<T = unknown>(path: string, options?: RequestOptions & { response?: "body" }): Promise<T>;
     public async request<T = unknown>(path: string, options: RequestOptions & { response: "raw" }): Promise<CallPoolResponse<T>>;
+    public async request<T = unknown>(path: string, options?: RequestOptions): Promise<T | CallPoolResponse<T>>;
     public async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T | CallPoolResponse<T>> {
         const { priority = 5, response = "body", exposeCookies = false, ...reqOpts } = options;
         if (!Number.isInteger(priority) || priority < 0 || priority > 9) {
             throw new Error("[CallPool] 'priority' must be an integer between 0 and 9");
         }
-        const envelope = await this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, reqOpts, exposeCookies));
+        const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
+        const envelope = await this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, reqOpts, exposeCookies), signal);
         return response === "raw" ? envelope : envelope.body;
     }
 
@@ -180,13 +203,21 @@ export class CallPool {
         // Retry waits happen INSIDE the scheduler slot: a retrying logical job
         // keeps occupying its concurrency slot, which acts as natural backpressure.
         for (let attempt = 1; ; attempt++) {
-            if (signal?.aborted) throw signal.reason ?? new Error("Request aborted");
+            signal?.throwIfAborted();
 
             try {
-                return await this.executeOnce<T>(path, reqOpts, exposeCookies);
+                const response = await this.executeOnce<T>(path, reqOpts, exposeCookies);
+                signal?.throwIfAborted();
+                return response;
             } catch (err) {
+                // Undici and timers can wrap abort errors. Preserve the caller's
+                // reason consistently, including non-Error values and null.
+                signal?.throwIfAborted();
+                // The signal is the server's, whatever this request does next:
+                // a 429 on the last attempt still says the pool is too fast.
+                if (err instanceof CallPoolError && err.statusCode === 429) this.onRateLimited(err.retryAfterMs ?? delay);
                 const retryable = this.isRetryableError(err);
-                if (!retryable || signal?.aborted || attempt >= this.maxAttempts) throw err;
+                if (!retryable || attempt >= this.maxAttempts) throw err;
 
                 // A 429 carries its own (capped) Retry-After wait, honored
                 // as-is instead of stacking the backoff delay on top of it.
@@ -212,14 +243,19 @@ export class CallPool {
         // The type-level Omit doesn't stop plain-JS callers: drop the key for real.
         delete (dispatcherOptions as { throwOnError?: boolean }).throwOnError;
         let body = requestBody;
-        const headers = { ...this.defaultHeaders, ...requestHeaders } as Record<string, string>;
+        const headers = this.mergeHeaders(requestHeaders);
 
         if (body && typeof body === "object" && !Buffer.isBuffer(body) && !(body instanceof Uint8Array)) {
             body = JSON.stringify(body);
-            if (!this.hasHeader(headers, "content-type")) headers["Content-Type"] = "application/json";
+            if (!("content-type" in headers)) headers["content-type"] = "application/json";
         }
 
-        if (this.rateGate) await this.rateGate.acquire();
+        const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
+        signal?.throwIfAborted();
+        if (this.rateGate) await this.rateGate.acquire(signal);
+        // Abort can arrive after the gate grants permission but before this
+        // async continuation resumes. Do not dispatch HTTP in that case.
+        signal?.throwIfAborted();
         const start = performance.now();
         const response = await this.client.request({
             ...dispatcherOptions,
@@ -236,37 +272,43 @@ export class CallPool {
 
         const ttfb = performance.now() - start;
         const statusCode = response.statusCode;
+        const adaptThisResponse = this.adaptiveEnabled && statusCode < 400;
+        if (statusCode < 400 && this.rateLimitHold > 0) this.rateLimitHold--;
+        // TTFB feedback can change scheduling while this body is still downloading.
+        if (adaptThisResponse && this.useTTFB && ttfb > 0) {
+            this.updateThrottleLogic(ttfb);
+        }
         const resHeaders = this.sanitizeHeaders(response.headers);
-        const contentType = this.getHeaderValue(resHeaders["content-type"]);
+        const responseType = this.getResponseBodyType(this.getHeaderValue(resHeaders["content-type"]));
         // `binary` is the caller's own answer to the question the header is
         // meant to answer: a server that omits Content-Type, or calls a JPEG
         // text, would otherwise cost the response its bytes in a UTF-8 decode.
-        const isBinaryResponse =
-            statusCode < 400 &&
-            (binary ||
-                (contentType !== undefined && !contentType.includes("application/json") && !this.isTextContentType(contentType)));
+        const isBinaryResponse = statusCode < 400 && (binary || responseType === "binary");
 
         // Preserve bytes only for successful binary media. Text, JSON and error
         // bodies keep their established string representation.
         const rawBody = isBinaryResponse ? Buffer.from(await response.body.arrayBuffer()) : await response.body.text();
 
-        const measuredDuration = this.useTTFB ? ttfb : performance.now() - start;
-
-        // Adaptive Logic Hook
-        if (this.adaptiveEnabled && measuredDuration > 0 && statusCode < 400) {
-            this.updateThrottleLogic(measuredDuration);
+        // Full-download mode samples here; TTFB mode already sampled at headers.
+        if (adaptThisResponse && !this.useTTFB) {
+            const measuredDuration = performance.now() - start;
+            if (measuredDuration > 0) this.updateThrottleLogic(measuredDuration);
         }
 
         // A Buffer rawBody implies isBinaryResponse, hence statusCode < 400:
         // assertSuccess never reads the body there, so skip the utf8 decode.
         this.assertSuccess(statusCode, typeof rawBody === "string" ? rawBody : "", resHeaders);
 
+        // Only bodyless HTTP responses skip decoding. An empty ordinary JSON
+        // response is still invalid, and an explicit byte request stays a Buffer.
+        const emptyResponse = rawBody.length === 0 && (method === "HEAD" || statusCode === 204 || statusCode === 205 || statusCode === 304);
+
         // Errors above always carry the sanitized copy; the opt-in only
         // uncovers Set-Cookie in the success envelope the caller asked for.
         return {
             status: statusCode,
             headers: exposeCookies ? { ...response.headers } : resHeaders,
-            body: this.parseBody<T>(statusCode, rawBody, resHeaders),
+            body: emptyResponse && !binary ? undefined as T : this.parseBody<T>(statusCode, rawBody, resHeaders, responseType === "json"),
         };
     }
 
@@ -306,12 +348,11 @@ export class CallPool {
         }
     }
 
-    private parseBody<T>(statusCode: number, rawBody: string | Buffer, resHeaders: Record<string, string | string[] | undefined>): T {
+    private parseBody<T>(statusCode: number, rawBody: string | Buffer, resHeaders: Record<string, string | string[] | undefined>, isJson: boolean): T {
         // Bytes were asked for, explicitly or by content type: parsing them
         // back into JSON would undo the very thing that was requested.
         if (Buffer.isBuffer(rawBody)) return rawBody as unknown as T;
-        const contentType = this.getHeaderValue(resHeaders["content-type"]);
-        if (contentType && contentType.includes("application/json")) {
+        if (isJson) {
             try {
                 return JSON.parse(rawBody) as T;
             } catch {
@@ -322,23 +363,33 @@ export class CallPool {
         return rawBody as unknown as T;
     }
 
-    private isTextContentType(contentType: string): boolean {
+    private getResponseBodyType(contentType: string | undefined): "json" | "text" | "binary" {
+        if (contentType === undefined) return "text";
+        // Share one classification between byte reading and JSON decoding;
+        // media type parameters must not influence either decision.
         const mediaType = contentType.split(";", 1)[0].trim().toLowerCase();
-        return (
+        if (mediaType === "application/json" || mediaType.endsWith("+json")) return "json";
+        if (
             mediaType.startsWith("text/") ||
-            mediaType.endsWith("+json") ||
             mediaType.endsWith("+xml") ||
             mediaType === "application/xml" ||
             mediaType === "application/javascript" ||
             mediaType === "application/x-javascript" ||
             mediaType === "application/x-www-form-urlencoded" ||
             mediaType === "image/svg+xml"
-        );
+        ) return "text";
+        return "binary";
     }
 
-    private hasHeader(headers: Record<string, string>, name: string) {
-        const lowerName = name.toLowerCase();
-        return Object.keys(headers).some(key => key.toLowerCase() === lowerName);
+    private mergeHeaders(requestHeaders?: Record<string, string>): Record<string, string> {
+        const headers: Record<string, string> = Object.create(null);
+        // Normalize each source separately so request overrides always win,
+        // even when defaults contain multiple spellings of the same name.
+        for (const [name, value] of Object.entries(this.defaultHeaders)) headers[name.toLowerCase()] = value;
+        if (requestHeaders) {
+            for (const [name, value] of Object.entries(requestHeaders)) headers[name.toLowerCase()] = value;
+        }
+        return headers;
     }
 
     private getHeaderValue(value: string | string[] | undefined) {
@@ -402,15 +453,42 @@ export class CallPool {
     }
 
     private increaseConcurrency() {
+        // After a 429 the latency baseline says nothing about the server's
+        // quota: growth waits for `recoveryAfter` successes.
+        if (this.rateLimitHold > 0) return;
         const next = Math.min(this.currentConcurrency + this.increaseStep, this.maxConcurrency);
         this.applyNewSettings(next);
     }
 
-    private reduceConcurrency() {
+    private reduceConcurrency(factor: number = this.decreaseFactor) {
         // AIMD decrease: multiplicative factor, but always at least -1 connection.
-        const raw = Math.min(this.currentConcurrency * this.decreaseFactor, this.currentConcurrency - 1);
+        const raw = Math.min(this.currentConcurrency * factor, this.currentConcurrency - 1);
         const next = Math.max(raw, this.minConcurrency);
         this.applyNewSettings(next);
+    }
+
+    /**
+     * A 429 under `adaptive.rateLimitSignal`: one decrease per episode, the
+     * episode extended by every later 429, growth held for `recoveryAfter`
+     * successes and, with `pause`, every new attempt held until the wait the
+     * server asked for is over.
+     */
+    private onRateLimited(waitMs: number) {
+        const signal = this.rateLimitSignal;
+        if (!signal) return;
+
+        const now = performance.now();
+        const newEpisode = now >= this.rateLimitedUntil;
+        this.rateLimitedUntil = Math.max(this.rateLimitedUntil, now + waitMs);
+        this.rateLimitHold = signal.recoveryAfter;
+        this.congestionHits = 0;
+
+        if (newEpisode) {
+            this.reduceConcurrency(signal.decreaseFactor);
+            // The server is refusing now: apply the cut without the debounce.
+            this.flushLimiterUpdate();
+        }
+        if (signal.pause) this.rateGate?.pauseUntil(this.rateLimitedUntil);
     }
 
     private applyNewSettings(newConcurrency: number) {
@@ -468,6 +546,7 @@ export class CallPool {
             queued: this.scheduler.queued,
             running: this.scheduler.running,
             concurrency: this.currentConcurrency,
+            pausedFor: this.rateGate?.pausedFor() ?? 0,
         };
     }
 

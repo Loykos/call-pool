@@ -25,8 +25,10 @@ export interface CallPoolOptions {
         enabled?: boolean;
 
         /**
-         * true: Measures only TTFB (Time To First Byte). Great for variable payloads.
-         * false: Measures complete download.
+         * true: Measures TTFB (Time To First Byte) and updates the controller as
+         * soon as non-error response headers arrive, before reading the body.
+         * That sample is retained even if the later body download fails.
+         * false: Updates the controller after the complete body download.
          * Default: true
          */
         useTTFB?: boolean;
@@ -69,6 +71,16 @@ export interface CallPoolOptions {
          * Default: `concurrency.limit`
          */
         initialConcurrency?: number;
+
+        /**
+         * Treats a 429 as a pool-wide signal instead of a per-request one.
+         * Without it a 429 only makes the request that received it wait, while
+         * the other slots keep sending at full concurrency — the latency-based
+         * controller never sees the 429, since it samples successful responses
+         * only. `true` enables the defaults of {@link RateLimitSignalOptions}.
+         * Default: false
+         */
+        rateLimitSignal?: boolean | RateLimitSignalOptions;
     };
 
     /** Retry Configuration (Resilience) */
@@ -108,6 +120,34 @@ export interface CallPoolOptions {
          */
         proxy?: string;
     };
+}
+
+/**
+ * How a 429 steers an adaptive pool. One rate-limit episode — the 429 and
+ * every other 429 received before its wait is over — counts once: the
+ * requests already in flight when the server starts refusing must not drive
+ * the concurrency to its floor all together.
+ */
+export interface RateLimitSignalOptions {
+    /**
+     * Multiplicative decrease applied to concurrency once per episode, never
+     * below `adaptive.minConcurrency` and always at least one slot.
+     * Must be greater than 0 and less than 1. Default: 0.5
+     */
+    decreaseFactor?: number;
+
+    /**
+     * Holds every new HTTP attempt of the pool — not only the retry of the
+     * refused request — until the episode's wait is over: the `Retry-After`
+     * the server sent, or the retry delay when it sent none. Default: true
+     */
+    pause?: boolean;
+
+    /**
+     * Successful responses required after the last 429 before the controller
+     * may grow concurrency again. A non-negative integer. Default: 10
+     */
+    recoveryAfter?: number;
 }
 
 /**
@@ -158,6 +198,9 @@ export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin"
     body?: string | Buffer | Uint8Array | object | null;
     headers?: Record<string, string>;
     /**
+     * Optional cancellation for the entire logical request: scheduler queue,
+     * quota/minTime waits, HTTP/body download, and retry backoff. Rejections
+     * preserve signal.reason; an aborted request is never retried.
      * Narrowed to AbortSignal only (undici also accepts a legacy EventEmitter
      * shape, but the retry loop's abort guards would not see it).
      */
@@ -168,6 +211,8 @@ export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin"
      * body alone; `"raw"` resolves with a {@link CallPoolResponse} envelope
      * carrying status and headers as well. Error and retry semantics are
      * identical in both modes: 4xx/5xx still reject with CallPoolError.
+     * Options typed as RequestOptions return T | CallPoolResponse<T> when
+     * the response mode is not known at compile time.
      */
     response?: "body" | "raw";
 
@@ -202,7 +247,11 @@ export interface CallPoolResponse<T = unknown> {
     status: number;
     /** Response headers (Set-Cookie is redacted unless `exposeCookies` is set) */
     headers: Record<string, string | string[] | undefined>;
-    /** Body, parsed with the same rules as the default mode (JSON/text/Buffer) */
+    /**
+     * Body, parsed with the same rules as the default mode (JSON/text/Buffer).
+     * Empty HEAD/204/205/304 responses have an undefined body, or an empty
+     * Buffer with binary: true. Use T = void or T | undefined as appropriate.
+     */
     body: T;
 }
 
@@ -214,4 +263,6 @@ export interface CallPoolStats {
     running: number;
     /** Current concurrency limit (dynamically tuned when adaptive is enabled) */
     concurrency: number;
+    /** Milliseconds left before new attempts may start after a 429 (`rateLimitSignal.pause`), 0 otherwise */
+    pausedFor: number;
 }
