@@ -139,7 +139,8 @@ export interface RateLimitSignalOptions {
     /**
      * Holds every new HTTP attempt of the pool — not only the retry of the
      * refused request — until the episode's wait is over: the `Retry-After`
-     * the server sent, or the retry delay when it sent none. Default: true
+     * the server sent, or the default wait when it sent none — doubled at every
+     * new episode that starts before the pool has recovered. Default: true
      */
     pause?: boolean;
 

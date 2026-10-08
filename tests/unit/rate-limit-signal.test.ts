@@ -12,7 +12,7 @@ async function rateLimitedServer(refusals: number, retryAfter = "1", latency = 1
         onRequestStart: () => arrivals.push(performance.now()),
         statusCode: () => (server.getRequestCount() <= refusals ? 429 : 200),
         headers: (): Record<string, string> =>
-            server.getRequestCount() <= refusals ? { "Retry-After": retryAfter, "Content-Type": "application/json" } : { "Content-Type": "application/json" },
+            server.getRequestCount() <= refusals && retryAfter ? { "Retry-After": retryAfter, "Content-Type": "application/json" } : { "Content-Type": "application/json" },
     });
     return { server, baseUrl, arrivals };
 }
@@ -82,6 +82,44 @@ describe("adaptive.rateLimitSignal", () => {
             const afterRefusal = arrivals.slice(1).map(at => at - arrivals[0]);
             expect(Math.min(...afterRefusal)).toBeGreaterThanOrEqual(950);
             expect(pool.getStats().pausedFor).toBe(0);
+        } finally {
+            await Promise.all([pool.close(), server.stop()]);
+        }
+    }, 10_000);
+
+    it("doubles the pause when a server that names no wait refuses again before recovery", async () => {
+        // No Retry-After: the default wait (5s) is the server's only hint.
+        const { server, baseUrl, arrivals } = await rateLimitedServer(2, "", 5);
+        const pool = new CallPool({
+            baseUrl,
+            concurrency: { limit: 2 },
+            adaptive: { enabled: true, rateLimitSignal: true },
+            retry: { maxAttempts: 3 },
+        });
+        try {
+            await pool.request("/refused-twice");
+            const gaps = arrivals.slice(1).map((at, i) => at - arrivals[i]);
+            expect(gaps[0]).toBeGreaterThanOrEqual(4950);
+            expect(gaps[0]).toBeLessThan(6500);
+            expect(gaps[1]).toBeGreaterThanOrEqual(9950);
+        } finally {
+            await Promise.all([pool.close(), server.stop()]);
+        }
+    }, 25_000);
+
+    it("keeps an explicit Retry-After as-is on repeated refusals", async () => {
+        const { server, baseUrl, arrivals } = await rateLimitedServer(2, "1", 5);
+        const pool = new CallPool({
+            baseUrl,
+            concurrency: { limit: 2 },
+            adaptive: { enabled: true, rateLimitSignal: true },
+            retry: { maxAttempts: 3 },
+        });
+        try {
+            await pool.request("/refused-twice");
+            const gaps = arrivals.slice(1).map((at, i) => at - arrivals[i]);
+            expect(gaps[1]).toBeGreaterThanOrEqual(950);
+            expect(gaps[1]).toBeLessThan(1800);
         } finally {
             await Promise.all([pool.close(), server.stop()]);
         }
