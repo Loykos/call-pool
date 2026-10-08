@@ -26,7 +26,7 @@ describe.concurrent("Error Handling", () => {
 
                 // The Retry-After wait (2s) is honored exactly - no backoff is
                 // stacked on top. The upper bound proves the header was used:
-                // the 5s no-header default would push the total past 5s.
+                // no additional exponential delay should be stacked.
                 expect(duration).toBeGreaterThanOrEqual(2000);
                 expect(duration).toBeLessThan(4500);
                 expect(mockServer.getRequestCount()).toBe(2);
@@ -61,7 +61,7 @@ describe.concurrent("Error Handling", () => {
             }
         }, 10000);
 
-        it("should use default 5s wait if Retry-After header is missing", async () => {
+        it("should use default 1s wait if Retry-After header is missing", async () => {
             const mockServer = new MockServer();
             let attempt = 0;
             const baseUrl = await mockServer.start({
@@ -75,8 +75,8 @@ describe.concurrent("Error Handling", () => {
                 await pool.request("/test-429-no-header");
                 const duration = Date.now() - start;
 
-                // The class has a default of 5s for 429 without header
-                expect(duration).toBeGreaterThanOrEqual(5000);
+                // The class has a default of 1s for 429 without header
+                expect(duration).toBeGreaterThanOrEqual(1000);
                 expect(mockServer.getRequestCount()).toBe(2);
             } finally {
                 await Promise.all([pool.close(), mockServer.stop()]);
@@ -252,7 +252,7 @@ describe.concurrent("Error Handling", () => {
 
             const pool = new CallPool({
                 baseUrl,
-                network: { timeout: 1000 }, // Timeout at 1s
+                network: { headersTimeout: 1000, bodyTimeout: 1000 }, // Timeout at 1s
                 retry: { maxAttempts: 2, delay: 500 },
             });
 

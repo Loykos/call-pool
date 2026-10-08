@@ -1,15 +1,16 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { Pool, ProxyAgent, errors } from "undici";
-import { CallPoolOptions, CallPoolResponse, CallPoolStats, CallPoolTlsOptions, RateLimitSignalOptions, RequestOptions } from "./types.js";
+import { CallPoolOptions, CallPoolResponse, CallPoolStats, NetworkOptions, StatusCodeSelector, RateLimitSignalOptions, RequestOptions } from "./types.js";
 import { CallPoolError, PoolClosedError } from "./errors.js";
 import { RateGate } from "./rate-gate.js";
 import { RequestScheduler } from "./scheduler.js";
-import { validateOptions } from "./validation.js";
+import { RequestDeadline } from "./request-deadline.js";
+import { validateOptions, validateMaxElapsedTime } from "./validation.js";
 
 /** Per-request options left after the pool-level keys are extracted. */
-type TransportOptions = Omit<RequestOptions, "priority" | "response" | "exposeCookies">;
+type TransportOptions = Omit<RequestOptions, "priority" | "response" | "exposeCookies" | "maxElapsedTime">;
 
-const RATE_LIMIT_SIGNAL_DEFAULTS: Required<RateLimitSignalOptions> = { decreaseFactor: 0.5, pause: true, recoveryAfter: 10 };
+const RATE_LIMIT_SIGNAL_DEFAULTS: Required<RateLimitSignalOptions> = { decreaseFactor: 0.5, recoveryAfter: 10 };
 
 export class CallPool {
     private client: Pool | ProxyAgent;
@@ -23,7 +24,13 @@ export class CallPool {
     private retryDelay: number;
     private retryFactor: number;
     private maxRetryAfter: number;
-    private requestTimeout: number;
+    private maxElapsedTime: number | undefined;
+    private maxDelay: number;
+    private retryCodes: readonly StatusCodeSelector[];
+    private pauseCodes: readonly StatusCodeSelector[];
+    private retryNetworkErrors: boolean;
+    private pauseUntil = -Infinity;
+    private pauseBackoff: number | undefined;
     private defaultHeaders: Record<string, string>;
 
     // Adaptive Config (Flattened for perf)
@@ -35,7 +42,7 @@ export class CallPool {
     private increaseStep: number;
     private decreaseFactor: number;
 
-    // Rate-limit signal (adaptive only): null when 429s stay per-request
+    // Optional adaptive concurrency feedback, independent of retry/pause selectors.
     private rateLimitSignal: Required<RateLimitSignalOptions> | null;
 
     // Adaptive Bounds
@@ -55,8 +62,6 @@ export class CallPool {
     private rateLimitedUntil: number = -Infinity;
     /** Successes still required after the last 429 before concurrency may grow */
     private rateLimitHold: number = 0;
-    /** Pause of the last rate-limit episode, doubled when the server refuses again before recovery */
-    private rateLimitBackoff: number = 0;
 
     // Limiter State
     private currentConcurrency: number;
@@ -64,7 +69,8 @@ export class CallPool {
 
     /**
      * Creates a pool bound to a single base URL. Validates `options` synchronously
-     * and throws before any socket or limiter is created.
+     * before any socket or limiter is created. Native transport options are
+     * validated by Undici, sometimes lazily on the first request.
      *
      * @param options - Pool configuration; see {@link CallPoolOptions}.
      * @throws {Error} When `options` fails validation (e.g. missing/invalid `baseUrl`,
@@ -92,13 +98,17 @@ export class CallPool {
         this.maxConcurrency = concurrencyLimit;
 
         // --- 2. NETWORK & RETRY CONFIGURATION ---
-        this.requestTimeout = options.network?.timeout ?? 30_000;
-        this.defaultHeaders = options.network?.defaultHeaders ?? {};
+        this.defaultHeaders = options.defaultHeaders ?? {};
 
         this.maxAttempts = options.retry?.maxAttempts ?? 3;
         this.retryDelay = options.retry?.delay ?? 1000;
         this.retryFactor = options.retry?.factor ?? 2;
         this.maxRetryAfter = options.retry?.maxRetryAfter ?? 60_000;
+        this.maxElapsedTime = options.maxElapsedTime;
+        this.maxDelay = options.retry?.maxDelay ?? 60_000;
+        this.retryCodes = [...(options.retry?.codes ?? [408, 429, "5xx"])];
+        this.pauseCodes = [...(options.retry?.pauseCodes ?? [])];
+        this.retryNetworkErrors = options.retry?.networkErrors ?? true;
 
         // --- 3. CONCURRENCY SETUP ---
         // Adaptive pools may slow-start from initialConcurrency; otherwise
@@ -106,12 +116,12 @@ export class CallPool {
         this.currentConcurrency = this.adaptiveEnabled ? (adaptOpts?.initialConcurrency ?? this.maxConcurrency) : this.maxConcurrency;
 
         // --- 4. SETUP UNDICI & SCHEDULER ---
-        this.client = this.createClient(options.baseUrl, concurrencyLimit, options.network?.tls, options.network?.proxy);
+        this.client = this.createClient(options.baseUrl, concurrencyLimit, options.network);
         this.scheduler = new RequestScheduler({ maxConcurrent: this.currentConcurrency });
         const minTime = this.computeBaseMinTime(rateOpts);
         // The pause of a rate-limit episode is enforced by the gate, so it is
         // created even for a pool without contractual limits.
-        const needsGate = minTime > 0 || rateOpts?.quota || this.rateLimitSignal?.pause;
+        const needsGate = minTime > 0 || rateOpts?.quota || this.pauseCodes.length > 0;
         this.rateGate = needsGate ? new RateGate({ minTime, quota: rateOpts?.quota }) : null;
     }
 
@@ -127,37 +137,13 @@ export class CallPool {
         return Math.ceil(rateOpts.quota.window / rateOpts.quota.max);
     }
 
-    private createClient(baseUrl: string, connections: number, tls?: CallPoolTlsOptions, proxy?: string): Pool | ProxyAgent {
-        if (proxy) {
+    private createClient(baseUrl: string, connections: number, network?: NetworkOptions): Pool | ProxyAgent {
+        const defaults = { connections, pipelining: 1, keepAliveTimeout: 10_000, headersTimeout: 30_000, bodyTimeout: 30_000 };
+        if (network && "uri" in network && network.uri !== undefined) {
             this.proxiedOrigin = new URL(baseUrl).origin;
-            const proxyUrl = new URL(proxy);
-            // Credentials travel as Proxy-Authorization, not embedded in the
-            // uri: undici only reads them reliably from `token`.
-            const token = proxyUrl.username
-                ? `Basic ${Buffer.from(`${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`).toString("base64")}`
-                : undefined;
-            return new ProxyAgent({
-                uri: proxyUrl.origin,
-                ...(token ? { token } : {}),
-                connections,
-                pipelining: 1,
-                keepAliveTimeout: 10_000,
-                // TLS options apply to the tunneled connection to the target,
-                // not to the hop toward the proxy.
-                ...(tls ? { requestTls: { ...tls } } : {}),
-            });
+            return new ProxyAgent({ ...defaults, ...network });
         }
-
-        // Undici Pool needs the HARD limit (total sockets available)
-        return new Pool(baseUrl, {
-            connections,
-            pipelining: 1,
-            keepAliveTimeout: 10_000,
-            // Spread instead of `connect: undefined`: undici skips its default
-            // connector when the key is present, so pools without TLS options
-            // must not carry the key at all.
-            ...(tls ? { connect: { ...tls } } : {}),
-        });
+        return new Pool(baseUrl, { ...defaults, ...network });
     }
 
     /**
@@ -170,9 +156,12 @@ export class CallPool {
      * content. Empty HEAD/204/205/304 responses resolve with undefined unless
      * `binary: true` requests an empty Buffer.
      * HTTP failures (4xx/5xx) reject with {@link CallPoolError}; retryable failures
-     * (429, 408, 5xx) are retried up to `retry.maxAttempts`, honoring a capped
-     * `Retry-After` wait on 429s. Network-level errors (DNS, connection reset,
+     * (429, 408, 5xx by default) are retried up to `retry.maxAttempts`, honoring
+     * a capped `Retry-After` wait on HTTP failures. Network-level errors (DNS, connection reset,
      * timeouts) propagate unchanged.
+     * `maxElapsedTime` optionally bounds the whole logical request from
+     * submission, including queue time, and rejects with CallPoolTimeoutError
+     * if that deadline expires or a known wait cannot fit the remaining budget.
      *
      * @param path - Request path, appended to `baseUrl`.
      * @param options - Per-request overrides. `signal` aborts the request, including
@@ -189,47 +178,71 @@ export class CallPool {
     public async request<T = unknown>(path: string, options: RequestOptions & { response: "raw" }): Promise<CallPoolResponse<T>>;
     public async request<T = unknown>(path: string, options?: RequestOptions): Promise<T | CallPoolResponse<T>>;
     public async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T | CallPoolResponse<T>> {
-        const { priority = 5, response = "body", exposeCookies = false, ...reqOpts } = options;
+        const { priority = 5, response = "body", exposeCookies = false, maxElapsedTime = this.maxElapsedTime, ...reqOpts } = options;
         if (!Number.isInteger(priority) || priority < 0 || priority > 9) {
             throw new Error("[CallPool] 'priority' must be an integer between 0 and 9");
         }
-        const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
-        const envelope = await this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, reqOpts, exposeCookies), signal);
-        return response === "raw" ? envelope : envelope.body;
+        if (this.closePromise) throw new PoolClosedError();
+        validateMaxElapsedTime(maxElapsedTime);
+        const callerSignal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
+        const deadline = maxElapsedTime === undefined ? undefined : new RequestDeadline(maxElapsedTime, callerSignal);
+        const signal = deadline?.signal ?? callerSignal;
+        try {
+            // A pool already paused beyond this request's budget cannot serve
+            // it: do not add another job behind the blocked scheduler slots.
+            deadline?.assertCanWait(this.rateGate?.pausedFor() ?? 0);
+            const transportOptions = deadline ? { ...reqOpts, signal } : reqOpts;
+            const envelope = await this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, transportOptions, exposeCookies, deadline), signal);
+            return response === "raw" ? envelope : envelope.body;
+        } finally {
+            deadline?.dispose();
+        }
     }
 
-    private async executeWithRetry<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean): Promise<CallPoolResponse<T>> {
+    private async executeWithRetry<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean, deadline?: RequestDeadline): Promise<CallPoolResponse<T>> {
         const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
-        let delay = this.retryDelay;
+        let delay = Math.min(this.retryDelay, this.maxDelay);
 
         // Retry waits happen INSIDE the scheduler slot: a retrying logical job
         // keeps occupying its concurrency slot, which acts as natural backpressure.
         for (let attempt = 1; ; attempt++) {
             signal?.throwIfAborted();
+            deadline?.assertCanWait(this.rateGate?.pausedFor() ?? 0);
 
             try {
-                const response = await this.executeOnce<T>(path, reqOpts, exposeCookies);
+                const response = await this.executeOnce<T>(path, reqOpts, exposeCookies, deadline);
                 signal?.throwIfAborted();
+                deadline?.assertCanWait(0);
                 return response;
             } catch (err) {
                 // Undici and timers can wrap abort errors. Preserve the caller's
                 // reason consistently, including non-Error values and null.
                 signal?.throwIfAborted();
-                // The signal is the server's, whatever this request does next:
-                // a 429 on the last attempt still says the pool is too fast.
-                if (err instanceof CallPoolError && err.statusCode === 429) {
-                    this.onRateLimited(err.retryAfterMs ?? delay, Boolean(this.getHeaderValue(err.headers?.["retry-after"])));
+                // Pauses and adaptive feedback apply even when this request will
+                // not retry. Establish the pause before adaptive scheduling changes.
+                if (err instanceof CallPoolError && err.statusCode !== undefined && err.statusCode >= 400) {
+                    if (this.matchesCode(err.statusCode, this.pauseCodes)) this.onPause(err.retryAfterMs);
+                    if (err.statusCode === 429) this.onRateLimited(err.retryAfterMs ?? delay);
                 }
                 const retryable = this.isRetryableError(err);
                 if (!retryable || attempt >= this.maxAttempts) throw err;
 
-                // A 429 carries its own (capped) Retry-After wait, honored
+                // An HTTP failure may carry a capped Retry-After wait, honored
                 // as-is instead of stacking the backoff delay on top of it.
                 const waitMs = err instanceof CallPoolError && err.retryAfterMs !== undefined ? err.retryAfterMs : delay;
-                delay *= this.retryFactor;
+                // Pool pauses may have escalated well beyond this response's
+                // Retry-After fallback. Neither wait resets the total budget.
+                deadline?.assertCanWait(Math.max(waitMs, this.rateGate?.pausedFor() ?? 0), err);
+                delay = Math.min(delay * this.retryFactor, this.maxDelay);
                 // Abort resolves the wait instead of throwing: the loop's next
                 // iteration rethrows signal.reason, preserving the abort cause.
-                await sleep(waitMs, undefined, { signal }).catch(() => {});
+                // Node timers overflow beyond 2^31-1 ms; chunk long user waits.
+                const waitUntil = performance.now() + waitMs;
+                let remaining = waitMs;
+                while (remaining > 0 && !signal?.aborted) {
+                    await sleep(Math.min(remaining, 2_147_483_647), undefined, { signal }).catch(() => {});
+                    remaining = waitUntil - performance.now();
+                }
             }
         }
     }
@@ -239,10 +252,10 @@ export class CallPool {
         if (err instanceof PoolClosedError) return false;
         if (err instanceof errors.InvalidArgumentError || err instanceof errors.InvalidReturnValueError) return false;
         if (err instanceof errors.RequestAbortedError) return false;
-        return true;
+        return this.retryNetworkErrors;
     }
 
-    private async executeOnce<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean): Promise<CallPoolResponse<T>> {
+    private async executeOnce<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean, deadline?: RequestDeadline): Promise<CallPoolResponse<T>> {
         const { body: requestBody, headers: requestHeaders, method = "GET", binary = false, ...dispatcherOptions } = reqOpts;
         // The type-level Omit doesn't stop plain-JS callers: drop the key for real.
         delete (dispatcherOptions as { throwOnError?: boolean }).throwOnError;
@@ -256,7 +269,7 @@ export class CallPool {
 
         const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
         signal?.throwIfAborted();
-        if (this.rateGate) await this.rateGate.acquire(signal);
+        if (this.rateGate) await this.rateGate.acquire(signal, deadline);
         // Abort can arrive after the gate grants permission but before this
         // async continuation resumes. Do not dispatch HTTP in that case.
         signal?.throwIfAborted();
@@ -270,14 +283,14 @@ export class CallPool {
             method,
             headers,
             body: body as string | Buffer | Uint8Array | null,
-            headersTimeout: dispatcherOptions.headersTimeout ?? this.requestTimeout,
-            bodyTimeout: dispatcherOptions.bodyTimeout ?? this.requestTimeout,
         });
 
         const ttfb = performance.now() - start;
         const statusCode = response.statusCode;
         const adaptThisResponse = this.adaptiveEnabled && statusCode < 400;
         if (statusCode < 400 && this.rateLimitHold > 0) this.rateLimitHold--;
+        // An older in-flight success cannot reset a newer refusal episode.
+        if (statusCode < 400 && start >= this.pauseUntil) this.pauseBackoff = undefined;
         // TTFB feedback can change scheduling while this body is still downloading.
         if (adaptThisResponse && this.useTTFB && ttfb > 0) {
             this.updateThrottleLogic(ttfb);
@@ -326,30 +339,17 @@ export class CallPool {
     }
 
     private assertSuccess(statusCode: number, rawBody: string, resHeaders: Record<string, string | string[] | undefined>): void {
-        // 429 (Rate Limit): retryable, waits Retry-After in the retry loop
-        if (statusCode === 429) {
-            throw new CallPoolError("Rate Limit Hit (429)", {
-                statusCode,
-                body: rawBody,
-                headers: resHeaders,
-                retryable: true,
-                retryAfterMs: this.parseRetryAfterMs(resHeaders["retry-after"]),
-            });
-        }
+        if (statusCode < 400) return;
+        const message = statusCode === 429 ? "Rate Limit Hit (429)" : `${statusCode >= 500 ? "Server" : "Client"} Error ${statusCode}: ${rawBody.substring(0, 200)}`;
+        throw new CallPoolError(message, {
+            statusCode, body: rawBody, headers: resHeaders,
+            retryable: this.matchesCode(statusCode, this.retryCodes),
+            retryAfterMs: this.parseRetryAfterMs(resHeaders["retry-after"]),
+        });
+    }
 
-        // 5xx and 408 are transient, other 4xx are not retried
-        if (statusCode >= 500 || statusCode === 408) {
-            const message = statusCode === 408 ? "Request Timeout (408)" : `Server Error ${statusCode}`;
-            throw new CallPoolError(message, { statusCode, body: rawBody, headers: resHeaders, retryable: true });
-        }
-        if (statusCode >= 400) {
-            throw new CallPoolError(`Client Error ${statusCode}: ${rawBody.substring(0, 200)}`, {
-                statusCode,
-                body: rawBody,
-                headers: resHeaders,
-                retryable: false,
-            });
-        }
+    private matchesCode(code: number, selectors: readonly StatusCodeSelector[]): boolean {
+        return selectors.some(selector => selector === code || (selector === "4xx" && code >= 400 && code < 500) || (selector === "5xx" && code >= 500 && code < 600));
     }
 
     private parseBody<T>(statusCode: number, rawBody: string | Buffer, resHeaders: Record<string, string | string[] | undefined>, isJson: boolean): T {
@@ -401,19 +401,30 @@ export class CallPool {
     }
 
     private parseRetryAfterMs(value: string | string[] | undefined) {
-        // Always clamped to maxRetryAfter: an unbounded Retry-After would park
-        // a concurrency slot for its whole duration.
-        const defaultMs = Math.min(5000, this.maxRetryAfter);
-        const retryAfter = this.getHeaderValue(value);
-        if (!retryAfter) return defaultMs;
-
-        const seconds = Number(retryAfter);
-        if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, this.maxRetryAfter);
-
+        const retryAfter = this.getHeaderValue(value)?.trim();
+        if (!retryAfter) return undefined;
+        // Accept fractional seconds as well as integer delta-seconds. Numeric
+        // garbage (e.g. -1) must not accidentally parse as a historical date.
+        if (/^\d+(?:\.\d+)?$/.test(retryAfter)) {
+            const seconds = Number(retryAfter);
+            if (Number.isFinite(seconds)) return Math.min(seconds * 1000, this.maxRetryAfter);
+        }
+        if (!/[a-z]/i.test(retryAfter)) return undefined;
         const retryAt = Date.parse(retryAfter);
-        if (Number.isFinite(retryAt)) return Math.min(Math.max(0, retryAt - Date.now()), this.maxRetryAfter);
+        return Number.isFinite(retryAt) ? Math.min(Math.max(0, retryAt - Date.now()), this.maxRetryAfter) : undefined;
+    }
 
-        return defaultMs;
+    /** Shared fallback advances once per episode, independently of adaptive. */
+    private onPause(retryAfterMs: number | undefined): void {
+        const now = performance.now();
+        if (now >= this.pauseUntil) {
+            this.pauseBackoff = retryAfterMs ?? (this.pauseBackoff === undefined
+                ? Math.min(this.retryDelay, this.maxDelay)
+                : Math.min(Math.max(this.retryDelay, this.pauseBackoff * this.retryFactor), this.maxDelay));
+        }
+        const wait = retryAfterMs ?? Math.min(Math.max(this.retryDelay, this.pauseBackoff ?? this.retryDelay), this.maxDelay);
+        this.pauseUntil = Math.max(this.pauseUntil, now + wait);
+        this.rateGate?.pauseUntil(this.pauseUntil);
     }
 
     // ==========================================
@@ -471,37 +482,19 @@ export class CallPool {
         this.applyNewSettings(next);
     }
 
-    /**
-     * A 429 under `adaptive.rateLimitSignal`: one decrease per episode, the
-     * episode extended by every later 429, growth held for `recoveryAfter`
-     * successes and, with `pause`, every new attempt held until the wait the
-     * server asked for is over. A server that names no wait and refuses again
-     * before the pool has recovered gets twice the previous pause, up to
-     * `retry.maxRetryAfter`: the default wait was evidently too short.
-     */
-    private onRateLimited(waitMs: number, explicit: boolean) {
+    /** Adaptive concurrency feedback is separate from the shared pause policy. */
+    private onRateLimited(waitMs: number) {
         const signal = this.rateLimitSignal;
         if (!signal) return;
-
         const now = performance.now();
         const newEpisode = now >= this.rateLimitedUntil;
-        if (newEpisode) this.rateLimitBackoff = this.episodeWait(waitMs, explicit);
-        const wait = explicit ? waitMs : Math.max(waitMs, this.rateLimitBackoff);
-        this.rateLimitedUntil = Math.max(this.rateLimitedUntil, now + wait);
+        this.rateLimitedUntil = Math.max(this.rateLimitedUntil, this.pauseUntil, now + waitMs);
         this.rateLimitHold = signal.recoveryAfter;
         this.congestionHits = 0;
-
         if (newEpisode) {
             this.reduceConcurrency(signal.decreaseFactor);
-            // The server is refusing now: apply the cut without the debounce.
             this.flushLimiterUpdate();
         }
-        if (signal.pause) this.rateGate?.pauseUntil(this.rateLimitedUntil);
-    }
-
-    private episodeWait(waitMs: number, explicit: boolean): number {
-        const escalate = !explicit && this.rateLimitHold > 0;
-        return escalate ? Math.min(Math.max(waitMs, this.rateLimitBackoff * 2), this.maxRetryAfter) : waitMs;
     }
 
     private applyNewSettings(newConcurrency: number) {

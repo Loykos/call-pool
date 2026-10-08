@@ -1,6 +1,6 @@
 {
     "name": "call-pool",
-    "version": "0.7.1",
+    "version": "0.8.0",
     "description": "HTTP request pool con rate limiting, retry e adaptive throttling",
     "type": "module",
     "main": "./dist/index.js",
@@ -31,7 +31,9 @@
         "test:coverage": "vitest --coverage",
         "test:ui": "vitest --ui",
         "test:run": "vitest run && pnpm test:types",
-        "test:types": "tsc --project tests/types/tsconfig.json"
+        "test:types": "tsc --project tests/types/tsconfig.json",
+        "typecheck": "tsc --noEmit",
+        "test:e2e": "vitest run tests/e2e"
     },
     "keywords": [
         "http",

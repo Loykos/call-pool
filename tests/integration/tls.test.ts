@@ -53,7 +53,7 @@ describe.skipIf(!hasOpenssl)("TLS with a private CA", () => {
         rmSync(dir, { recursive: true, force: true });
     });
 
-    const poolFor = (tls?: any) => new CallPool({ baseUrl, retry: { maxAttempts: 1 }, network: { timeout: 5000, tls } });
+    const poolFor = (tls?: any) => new CallPool({ baseUrl, retry: { maxAttempts: 1 }, network: { headersTimeout: 5000, bodyTimeout: 5000, ...(tls ? { connect: tls } : {}) } });
 
     it("should fail without the CA", async () => {
         const pool = poolFor();

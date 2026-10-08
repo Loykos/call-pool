@@ -10,11 +10,9 @@ describe.concurrent("Configuration Enforcement", () => {
 
             const pool = new CallPool({
                 baseUrl,
-                network: {
-                    defaultHeaders: {
-                        "X-App-Name": "CallPool-Test",
-                        "X-Env": "Test",
-                    },
+                defaultHeaders: {
+                    "X-App-Name": "CallPool-Test",
+                    "X-Env": "Test",
                 },
             });
 
@@ -37,7 +35,7 @@ describe.concurrent("Configuration Enforcement", () => {
 
             const pool = new CallPool({
                 baseUrl,
-                network: { timeout: 800 }, // Timeout configurato a meno della latenza
+                network: { headersTimeout: 800, bodyTimeout: 800 }, // Timeout configurato a meno della latenza
                 retry: { maxAttempts: 1 }, // Nessun retry per isolare il timeout
             });
 
@@ -57,7 +55,6 @@ describe.concurrent("Configuration Enforcement", () => {
             expect(() => new CallPool({ baseUrl: "http://localhost", concurrency: { limit: 0 } })).toThrow(/concurrency\.limit/);
             expect(() => new CallPool({ baseUrl: "http://localhost", rateLimit: { minTime: -1 } })).toThrow(/rateLimit\.minTime/);
             expect(() => new CallPool({ baseUrl: "http://localhost", retry: { maxAttempts: 0 } })).toThrow(/retry\.maxAttempts/);
-            expect(() => new CallPool({ baseUrl: "http://localhost", network: { timeout: 0 } })).toThrow(/network\.timeout/);
             expect(() => new CallPool({ baseUrl: "http://localhost", adaptive: { decreaseFactor: 1 } })).toThrow(/adaptive\.decreaseFactor/);
             expect(() => new CallPool({ baseUrl: "http://localhost", retry: { maxRetryAfter: -1 } })).toThrow(/retry\.maxRetryAfter/);
             expect(() => new CallPool({ baseUrl: "http://localhost", concurrency: { limit: 5 }, adaptive: { initialConcurrency: 6 } })).toThrow(
@@ -69,14 +66,14 @@ describe.concurrent("Configuration Enforcement", () => {
         });
 
         it("should fail early on invalid proxy configuration", () => {
-            expect(() => new CallPool({ baseUrl: "http://localhost", network: { proxy: "" } })).toThrow(/network\.proxy/);
-            expect(() => new CallPool({ baseUrl: "http://localhost", network: { proxy: "not a url" } })).toThrow(/network\.proxy/);
-            expect(() => new CallPool({ baseUrl: "http://localhost", network: { proxy: "socks5://127.0.0.1:1080" } })).toThrow(/network\.proxy/);
+            expect(() => new CallPool({ baseUrl: "http://localhost", network: { uri: "" } })).toThrow(/./);
+            expect(() => new CallPool({ baseUrl: "http://localhost", network: { uri: "not a url" } })).toThrow(/./);
+            expect(() => new CallPool({ baseUrl: "http://localhost", network: { uri: "socks5://127.0.0.1:1080" } })).toThrow(/./);
         });
 
         it("should accept a valid proxy URL, with or without credentials", async () => {
-            const bare = new CallPool({ baseUrl: "http://localhost", network: { proxy: "http://127.0.0.1:3128" } });
-            const authed = new CallPool({ baseUrl: "http://localhost", network: { proxy: "http://user:pass@127.0.0.1:3128" } });
+            const bare = new CallPool({ baseUrl: "http://localhost", network: { uri: "http://127.0.0.1:3128" } });
+            const authed = new CallPool({ baseUrl: "http://localhost", network: { uri: "http://user:pass@127.0.0.1:3128" } });
             await Promise.all([bare.close(), authed.close()]);
         });
 

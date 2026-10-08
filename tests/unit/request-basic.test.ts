@@ -122,7 +122,7 @@ describe.concurrent("Request Basic", () => {
             const baseUrl = await mockServer.start({ onRequestStart: req => rawRequests.push([...req.rawHeaders]) });
             const defaultHeaders = Object.freeze({ [defaultName]: "Bearer default", "Content-Type": "text/plain", "X-Default": "keep" });
             const requestHeaders = Object.freeze({ [requestName]: "Bearer request", "content-type": "application/vnd.api+json" });
-            const pool = new CallPool({ baseUrl, network: { defaultHeaders } });
+            const pool = new CallPool({ baseUrl, defaultHeaders });
 
             try {
                 await pool.request("/override", { method: "POST", body: { ok: true }, headers: requestHeaders });
@@ -145,7 +145,7 @@ describe.concurrent("Request Basic", () => {
             const baseUrl = await mockServer.start({ onRequestStart: req => rawRequests.push([...req.rawHeaders]) });
             const pool = new CallPool({
                 baseUrl,
-                network: { defaultHeaders: { Authorization: "Bearer first", authorization: "Bearer last", "X-Mode": "default" } },
+                defaultHeaders: { Authorization: "Bearer first", authorization: "Bearer last", "X-Mode": "default" },
             });
 
             try {
@@ -168,9 +168,7 @@ describe.concurrent("Request Basic", () => {
             const baseUrl = await mockServer.start();
             const pool = new CallPool({
                 baseUrl,
-                network: {
-                    defaultHeaders: { "X-Default": "1", "X-Override": "old" },
-                },
+                defaultHeaders: { "X-Default": "1", "X-Override": "old" },
             });
 
             try {

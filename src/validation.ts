@@ -1,4 +1,4 @@
-import { CallPoolOptions, CallPoolTlsOptions } from "./types.js";
+import { CallPoolOptions, StatusCodeSelector } from "./types.js";
 
 export function validateOptions(options: CallPoolOptions): void {
     if (!options || typeof options.baseUrl !== "string" || options.baseUrl.length === 0) {
@@ -16,79 +16,33 @@ export function validateOptions(options: CallPoolOptions): void {
         throw new Error("[CallPool] 'concurrency.limit' must be a positive integer");
     }
 
-    const timeout = options.network?.timeout;
-    if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) {
-        throw new Error("[CallPool] 'network.timeout' must be a positive number");
+    validateMaxElapsedTime(options.maxElapsedTime);
+    // Removed aliases must not silently bypass proxy/TLS/timeout configuration
+    // for JavaScript consumers migrating from 0.7.
+    for (const key of ["timeout", "defaultHeaders", "tls", "proxy"]) {
+        if (options.network && key in options.network) {
+            throw new Error(`[CallPool] 'network.${key}' was removed in 0.8; use native Undici options (see migration guide)`);
+        }
     }
-
-    validateProxyOption(options.network?.proxy);
-    validateTlsOptions(options.network?.tls);
+    if (options.retry && "maxElapsedTime" in options.retry) {
+        throw new Error("[CallPool] 'retry.maxElapsedTime' moved to 'maxElapsedTime'");
+    }
     validateRateLimitOptions(options.rateLimit);
     validateRetryOptions(options.retry);
     validateAdaptiveOptions(options.adaptive, concurrencyLimit);
 }
 
-function validateProxyOption(proxy: string | undefined): void {
-    if (proxy === undefined) return;
-    if (typeof proxy !== "string" || proxy.length === 0) {
-        throw new Error("[CallPool] 'network.proxy' must be a non-empty string");
-    }
-
-    let url: URL;
-    try {
-        url = new URL(proxy);
-    } catch {
-        throw new Error("[CallPool] 'network.proxy' must be a valid URL");
-    }
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-        throw new Error("[CallPool] 'network.proxy' must use the http or https protocol");
+export function validateMaxElapsedTime(value: number | undefined): void {
+    if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+        throw new Error("[CallPool] 'maxElapsedTime' must be a positive finite number");
     }
 }
 
-function validateTlsOptions(tls: CallPoolTlsOptions | undefined): void {
-    if (tls === undefined) return;
-    if (typeof tls !== "object" || tls === null || Array.isArray(tls)) {
-        throw new Error("[CallPool] 'network.tls' must be an object");
-    }
-
-    const cas = tls.ca === undefined ? [] : Array.isArray(tls.ca) ? tls.ca : [tls.ca];
-    if (Array.isArray(tls.ca) && tls.ca.length === 0) {
-        throw new Error("[CallPool] 'network.tls.ca' must not be an empty array");
-    }
-    cas.forEach((ca, i) => validatePem(ca, Array.isArray(tls.ca) ? `network.tls.ca[${i}]` : "network.tls.ca"));
-
-    if (tls.cert !== undefined) validatePem(tls.cert, "network.tls.cert");
-    if (tls.key !== undefined) validatePem(tls.key, "network.tls.key");
-    if ((tls.cert === undefined) !== (tls.key === undefined)) {
-        throw new Error("[CallPool] 'network.tls.cert' and 'network.tls.key' must be provided together");
-    }
-
-    if (tls.passphrase !== undefined && typeof tls.passphrase !== "string") {
-        throw new Error("[CallPool] 'network.tls.passphrase' must be a string");
-    }
-    if (tls.servername !== undefined && (typeof tls.servername !== "string" || tls.servername.length === 0)) {
-        throw new Error("[CallPool] 'network.tls.servername' must be a non-empty string");
-    }
-    if (tls.rejectUnauthorized !== undefined && typeof tls.rejectUnauthorized !== "boolean") {
-        throw new Error("[CallPool] 'network.tls.rejectUnauthorized' must be a boolean");
-    }
-}
-
-/**
- * Guards the most common mistake: passing a file path instead of the PEM
- * content. Node would silently ignore the unparsable value and fail later
- * with an opaque handshake error.
- */
-function validatePem(value: string | Buffer, field: string): void {
-    if (Buffer.isBuffer(value)) {
-        if (value.length === 0) throw new Error(`[CallPool] '${field}' must not be empty`);
-        return;
-    }
-    if (typeof value !== "string" || value.trim().length === 0) {
-        throw new Error(`[CallPool] '${field}' must be a non-empty string or Buffer`);
-    }
-    if (!value.includes("-----BEGIN")) {
-        throw new Error(`[CallPool] '${field}' must be PEM content, not a file path`);
+function validateCodes(codes: readonly StatusCodeSelector[] | undefined, field: string): void {
+    if (codes === undefined) return;
+    if (!Array.isArray(codes) || codes.some(code => code !== "4xx" && code !== "5xx" &&
+        (!Number.isInteger(code) || code < 400 || code > 599))) {
+        throw new Error(`[CallPool] '${field}' must be an array of HTTP error codes (400-599), '4xx' or '5xx'`);
     }
 }
 
@@ -125,6 +79,14 @@ function validateRetryOptions(retry: CallPoolOptions["retry"]): void {
     if (retry?.maxRetryAfter !== undefined && (!Number.isFinite(retry.maxRetryAfter) || retry.maxRetryAfter < 0)) {
         throw new Error("[CallPool] 'retry.maxRetryAfter' must be a non-negative number");
     }
+    if (retry?.maxDelay !== undefined && (!Number.isFinite(retry.maxDelay) || retry.maxDelay < 0)) {
+        throw new Error("[CallPool] 'retry.maxDelay' must be a non-negative number");
+    }
+    if (retry?.networkErrors !== undefined && typeof retry.networkErrors !== "boolean") {
+        throw new Error("[CallPool] 'retry.networkErrors' must be a boolean");
+    }
+    validateCodes(retry?.codes, "retry.codes");
+    validateCodes(retry?.pauseCodes, "retry.pauseCodes");
 }
 
 function validateAdaptiveOptions(adaptive: CallPoolOptions["adaptive"], concurrencyLimit: number): void {
@@ -172,12 +134,12 @@ function validateRateLimitSignal(signal: NonNullable<CallPoolOptions["adaptive"]
     if (typeof signal !== "object" || signal === null || Array.isArray(signal)) {
         throw new Error("[CallPool] 'adaptive.rateLimitSignal' must be a boolean or an object");
     }
-    const { decreaseFactor, pause, recoveryAfter } = signal;
+    const { decreaseFactor, recoveryAfter } = signal;
     if (decreaseFactor !== undefined && (!Number.isFinite(decreaseFactor) || decreaseFactor <= 0 || decreaseFactor >= 1)) {
         throw new Error("[CallPool] 'adaptive.rateLimitSignal.decreaseFactor' must be greater than 0 and less than 1");
     }
-    if (pause !== undefined && typeof pause !== "boolean") {
-        throw new Error("[CallPool] 'adaptive.rateLimitSignal.pause' must be a boolean");
+    if ("pause" in signal) {
+        throw new Error("[CallPool] 'adaptive.rateLimitSignal.pause' moved to 'retry.pauseCodes'");
     }
     if (recoveryAfter !== undefined && (!Number.isInteger(recoveryAfter) || recoveryAfter < 0)) {
         throw new Error("[CallPool] 'adaptive.rateLimitSignal.recoveryAfter' must be a non-negative integer");

@@ -71,10 +71,10 @@ export class MockServer {
                 });
             });
 
-            this.server.listen(0, () => {
+            this.server.listen(0, "127.0.0.1", () => {
                 const address = this.server?.address() as AddressInfo;
                 this.port = address.port;
-                resolve(`http://localhost:${this.port}`);
+                resolve(`http://127.0.0.1:${this.port}`);
             });
 
             this.server.on("error", reject);
@@ -108,6 +108,6 @@ export class MockServer {
     }
 
     getUrl(): string {
-        return `http://localhost:${this.port}`;
+        return `http://127.0.0.1:${this.port}`;
     }
 }

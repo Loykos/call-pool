@@ -1,5 +1,6 @@
 import { CompactingQueue } from "./compacting-queue.js";
 import { PoolClosedError } from "./errors.js";
+import { RequestDeadline } from "./request-deadline.js";
 
 interface RateWaiter {
     resolve: () => void;
@@ -20,6 +21,7 @@ export class RateGate {
     private readonly quota: { max: number; window: number } | null;
     private readonly epoch = performance.now();
     private readonly waiters = new CompactingQueue<RateWaiter>(RATE_QUEUE_COMPACT_AT);
+    private readonly deadlines = new Set<RequestDeadline>();
 
     private tokens: number;
     private windowIndex = 0;
@@ -34,12 +36,14 @@ export class RateGate {
         this.tokens = this.quota?.max ?? Infinity;
     }
 
-    acquire(signal?: AbortSignal): Promise<void> {
+    acquire(signal?: AbortSignal, deadline?: RequestDeadline): Promise<void> {
+        signal = deadline?.signal ?? signal;
         if (this.stopped) return Promise.reject(new PoolClosedError());
         if (signal?.aborted) return Promise.reject(signal.reason);
         return new Promise<void>((resolve, reject) => {
             const waiter: RateWaiter = { resolve, reject };
             const entry = this.waiters.push(waiter);
+            if (deadline) this.deadlines.add(deadline);
             if (signal) {
                 const onAbort = () => {
                     if (!this.waiters.remove(entry)) return;
@@ -47,7 +51,10 @@ export class RateGate {
                     if (this.waiters.size === 0) this.clearWakeTimer();
                     reject(signal.reason);
                 };
-                waiter.cleanupAbort = () => signal.removeEventListener("abort", onAbort);
+                waiter.cleanupAbort = () => {
+                    signal.removeEventListener("abort", onAbort);
+                    if (deadline) this.deadlines.delete(deadline);
+                };
                 signal.addEventListener("abort", onAbort, { once: true });
             }
             this.dispatch();
@@ -86,6 +93,10 @@ export class RateGate {
     private dispatch(): void {
         while (!this.stopped && this.waiters.size > 0) {
             const wait = this.startDelay(performance.now());
+            // Recheck all waiting budgets when a later 429 extends the pause.
+            // Abort synchronously removes each waiter through its listener.
+            for (const deadline of this.deadlines) deadline.checkWait(wait);
+            if (this.waiters.size === 0) return;
             if (wait > 0) return this.wake(wait);
 
             const waiter = this.waiters.take();

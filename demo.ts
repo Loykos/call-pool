@@ -17,7 +17,8 @@ async function demo() {
             delay: 1000,
         },
         network: {
-            timeout: 10000,
+            headersTimeout: 10000,
+            bodyTimeout: 10000,
         },
     });
 

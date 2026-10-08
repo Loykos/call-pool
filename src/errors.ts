@@ -20,7 +20,7 @@ export class CallPoolError extends Error {
     public readonly headers?: Record<string, string | string[] | undefined>;
     /** Whether the pool retries this failure (subject to `retry.maxAttempts`) */
     public readonly retryable: boolean;
-    /** Parsed and capped Retry-After wait (ms), present on 429 responses */
+    /** Parsed and capped Retry-After wait (ms), present when the HTTP error has a valid header */
     public readonly retryAfterMs?: number;
 
     constructor(message: string, details: CallPoolErrorDetails = {}) {
@@ -31,6 +31,15 @@ export class CallPoolError extends Error {
         this.headers = details.headers;
         this.retryable = details.retryable ?? false;
         this.retryAfterMs = details.retryAfterMs;
+    }
+}
+
+/** A logical request exhausted its total budget, or its next wait cannot fit. */
+export class CallPoolTimeoutError extends CallPoolError {
+    constructor(public readonly maxElapsedTime: number, cause?: unknown) {
+        super(`[CallPool] Request cannot complete within maxElapsedTime (${maxElapsedTime}ms)`, { retryable: false });
+        this.name = "CallPoolTimeoutError";
+        if (cause !== undefined) this.cause = cause;
     }
 }
 

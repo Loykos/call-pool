@@ -70,7 +70,7 @@ describe("Proxy support", () => {
     it("should tunnel requests through the proxy and keep target semantics", async () => {
         const proxy = new ConnectProxy();
         const proxyUrl = await proxy.start();
-        const pool = new CallPool({ baseUrl, network: { proxy: proxyUrl } });
+        const pool = new CallPool({ baseUrl, network: { uri: proxyUrl } });
 
         try {
             const body = await pool.request<{ via: string }>("/tunneled");
@@ -95,7 +95,7 @@ describe("Proxy support", () => {
         const proxyUrl = await proxy.start(expectedAuth);
         const { hostname, port } = new URL(proxyUrl);
         const authedUrl = `http://${encodeURIComponent("user")}:${encodeURIComponent("p@ss/word")}@${hostname}:${port}`;
-        const pool = new CallPool({ baseUrl, network: { proxy: authedUrl } });
+        const pool = new CallPool({ baseUrl, network: { uri: authedUrl } });
 
         try {
             const body = await pool.request<{ via: string }>("/authed");
@@ -114,7 +114,7 @@ describe("Proxy support", () => {
         const pool = new CallPool({
             baseUrl: errorBaseUrl,
             retry: { maxAttempts: 1 },
-            network: { proxy: proxyUrl },
+            network: { uri: proxyUrl },
         });
 
         try {

@@ -81,7 +81,7 @@ await pool.close();
 
 ### Full Configuration Example
 
-Complete configuration with all options explicitly set.
+Example combining scheduling, failure policy and native transport settings.
 
 ```typescript
 import { CallPool } from "call-pool";
@@ -113,13 +113,15 @@ const pool = new CallPool({
         delay: 1000, // 1 second initial delay
         factor: 2, // Backoff between attempts: 1s, 2s
     },
+    maxElapsedTime: 60_000, // Includes queue, attempts and all waits
+    defaultHeaders: {
+        Authorization: "Bearer your-token-here",
+        "User-Agent": "MyApp/1.0",
+        "Content-Type": "application/json",
+    },
     network: {
-        timeout: 30000, // 30 seconds timeout
-        defaultHeaders: {
-            Authorization: "Bearer your-token-here",
-            "User-Agent": "MyApp/1.0",
-            "Content-Type": "application/json",
-        },
+        headersTimeout: 30_000,
+        bodyTimeout: 30_000,
     },
 });
 
@@ -151,6 +153,8 @@ await pool.close();
 | Option    | Type     | Required | Default | Description               |
 | --------- | -------- | -------- | ------- | ------------------------- |
 | `baseUrl` | `string` | Yes      | -       | Base URL for all requests |
+| `defaultHeaders` | `Record<string, string>` | No | `{}` | Target request headers; per-request headers override them case-insensitively |
+| `maxElapsedTime` | `number` | No | unlimited | Positive finite total request budget in ms, including queue; overridable per request |
 
 ### Concurrency Configuration
 
@@ -181,87 +185,162 @@ await pool.close();
 | `adaptive.initialConcurrency` | `number` | No    | `concurrency.limit` | Starting concurrency for the adaptive algorithm (slow-start). Must be between `minConcurrency` and `concurrency.limit` |
 | `adaptive.rateLimitSignal` | `boolean \| object` | No | `false` | Treats a 429 as a pool-wide signal (see [Rate-limit signal](#rate-limit-signal)). `true` uses the defaults below |
 | `adaptive.rateLimitSignal.decreaseFactor` | `number` | No | `0.5` | Multiplicative concurrency cut applied once per rate-limit episode. Must be greater than 0 and less than 1 |
-| `adaptive.rateLimitSignal.pause` | `boolean` | No | `true` | Holds every new attempt of the pool until the episode's `Retry-After` is over |
 | `adaptive.rateLimitSignal.recoveryAfter` | `number` | No | `10` | Successful responses required after the last 429 before concurrency may grow again |
 
 ### Retry Configuration
 
-| Option              | Type     | Required | Default | Description                                         |
-| ------------------- | -------- | -------- | ------- | --------------------------------------------------- |
-| `retry.maxAttempts` | `number` | No       | `3`     | Maximum total attempts, including the initial request |
-| `retry.delay`       | `number` | No       | `1000`  | Base delay in ms before the first retry             |
-| `retry.factor`      | `number` | No       | `2`     | Exponential backoff factor (delay × factor^attempt) |
-| `retry.maxRetryAfter` | `number` | No     | `60000` | Upper bound in ms for the wait honored from a 429 `Retry-After` header |
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `retry.maxAttempts` | `number` | `3` | Total HTTP attempts, including the first |
+| `retry.codes` | `readonly (number \| "4xx" \| "5xx")[]` | `[408, 429, "5xx"]` | HTTP failures to retry; replaces defaults, `[]` disables HTTP retries |
+| `retry.pauseCodes` | same as `codes` | `[]` | HTTP failures that pause every new attempt of this pool |
+| `retry.networkErrors` | `boolean` | `true` | Retry transport failures independently of HTTP selectors |
+| `retry.delay` | `number` | `1000` | Initial fallback wait in ms without a valid `Retry-After` |
+| `retry.factor` | `number` | `2` | Fallback multiplier per retry / shared pause episode |
+| `retry.maxDelay` | `number` | `60000` | Cap in ms for fallback backoff, including the initial wait |
+| `retry.maxRetryAfter` | `number` | `60000` | Cap in ms for waits from a valid `Retry-After` |
+
+Numeric selectors must be integers from 400 to 599. The two lists are independent:
+
+| Response matches | Refused request | Rest of pool |
+| --- | --- | --- |
+| `codes` only | Retries while attempts remain | Free slots can keep sending |
+| `pauseCodes` only | Rejects immediately after the response is consumed | New attempts wait; queued jobs are retained |
+| Both | Retries while attempts remain | New attempts wait |
+| Neither | Rejects | No shared pause |
+
+Retry waits occupy the logical request's concurrency slot. With concurrency 1, a retrying request therefore also holds up the queue even without a shared pause. In-flight HTTP attempts are never cancelled by a pause. Waiting does not consume attempts; every actual retry acquires rate-limit permission again. A matching final failure still pauses the pool.
+
+A valid `Retry-After` (seconds or HTTP date) replaces the fallback wait for that response, capped by `maxRetryAfter`. Missing, empty or invalid headers use `delay`, multiplied by `factor` after each failed attempt and capped by `maxDelay`. This applies to configured HTTP failures, including 503, not only 429.
+
+Shared fallback backoff advances once per pause episode: concurrent matching failures received during an existing pause can extend it but do not multiply it repeatedly. After the pause expires, a new matching failure starts the next episode. A successful response from an attempt started after the pause resets shared backoff; an older in-flight success does not. Explicit header waits are honored without multiplication, and become the base for a subsequent fallback episode, whose wait is at least `delay` (subject to `maxDelay`). A shorter wait never shortens an already active pause.
+
+Retry and pause waits overlap: a request can restart once both its own wait and the shared pause have elapsed, subject to concurrency, spacing and quota. Two matching 5-second waits do **not** become 10 seconds. `getStats().pausedFor` exposes the remaining shared pause.
+
+Pauses work without adaptive throttling. This is not a circuit breaker: the queue stays intact and resumes normally after the pause, without a half-open probe. A persistently refusing server can keep the queue waiting unless a total budget or cancellation is configured.
+
+```ts
+const pool = new CallPool({
+    baseUrl: "https://portal.example.com",
+    retry: {
+        codes: [408, 429, "5xx"],
+        pauseCodes: [429], // Explicit opt-in to shared pauses
+        delay: 1000,
+        factor: 2,
+        maxDelay: 60_000,
+    },
+});
+```
+
+#### Bounding requests against a persistently rate-limited server
+
+`retry.maxDelay` and `retry.maxRetryAfter` cap individual waits; repeated pauses can still keep a request and the queue behind it waiting for minutes. Set `maxElapsedTime` to bound the whole logical request, starting when it is submitted to the pool:
+
+```ts
+import { CallPool, CallPoolTimeoutError } from "call-pool";
+
+const pool = new CallPool({
+    baseUrl: "https://api.example.com",
+    maxElapsedTime: 10_000,
+    retry: { maxAttempts: 3, pauseCodes: [429] },
+});
+
+try {
+    const result = await pool.request("/resource");
+} catch (error) {
+    if (error instanceof CallPoolTimeoutError) {
+        // Skip this resource: its remaining budget cannot accommodate the wait,
+        // or its total deadline expired. The pool will not retry this error.
+        console.warn("Request budget exhausted", error.maxElapsedTime);
+    } else {
+        throw error;
+    }
+} finally {
+    await pool.close();
+}
+```
+
+A known retry delay, quota/spacing wait, or pool pause that cannot fit in the remaining budget rejects immediately. New requests also fail before entering the scheduler when the current pool pause already exceeds their budget. Queued requests keep their original deadline; each retry uses the same budget. If a later 429 extends the pause, requests already waiting at the rate gate are checked again. Other waits, including active HTTP and body reads, are cancelled when the deadline expires.
+
+`CallPoolTimeoutError` extends `CallPoolError`, has `retryable: false`, and exposes `maxElapsedTime`. When a retry is refused because its wait cannot fit, `cause` contains the original failure (including the 429 response details). The timeout itself has no HTTP status. Caller cancellation still preserves the caller's `signal.reason`. A timeout releases queued jobs or waiting permissions; an active HTTP attempt releases its slot when the transport settles after cancellation.
+
+This budget works with or without adaptive throttling. It does not shorten the server's pool pause: later work can resume after that pause. `network.headersTimeout` and `network.bodyTimeout` govern transport waits within each attempt. Without `maxElapsedTime`, there is no total deadline. Pass `request(path, { maxElapsedTime: 2000 })` to override the pool default for one request; omitting it inherits the default.
 
 ### Network Configuration
 
-| Option                   | Type                     | Required | Default | Description                         |
-| ------------------------ | ------------------------ | -------- | ------- | ----------------------------------- |
-| `network.timeout`        | `number`                 | No       | `30000` | Header and body inactivity timeout for a single request in ms |
-| `network.defaultHeaders` | `Record<string, string>` | No       | `{}`    | Headers to include in every request |
-| `network.tls`            | `object`                 | No       | -       | TLS settings for this pool's connections (see below) |
-| `network.proxy`          | `string`                 | No       | -       | HTTP(S) forward proxy URL for this pool (see below) |
+`network` accepts native Undici `Pool.Options` for direct connections, or `ProxyAgent.Options` when `uri` is present. Values are forwarded to the selected constructor without renaming or filtering; native validation and semantics apply. Some transport validation happens on the first request.
 
-#### Proxy
+CallPool supplies these defaults, which explicit network options override:
 
-When `network.proxy` is set, every request reaches `baseUrl` through a CONNECT tunnel opened on the proxy. Credentials embedded in the URL are extracted and sent as `Proxy-Authorization` (Basic).
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `connections` | `concurrency.limit` | Maximum transport connections; independent of logical scheduler concurrency |
+| `pipelining` | `1` | Native HTTP pipelining setting; `0` disables keep-alive |
+| `keepAliveTimeout` | `10000` | Undici keep-alive timeout in ms |
+| `headersTimeout` | `30000` | Undici response-header timeout in ms |
+| `bodyTimeout` | `30000` | Undici body inactivity timeout in ms |
+
+For options supported at both levels, request overrides take precedence over `network`, then CallPool defaults. `0` retains Undici's meaning for timeouts. Other constructor options, including connector functions, factories, interceptors and TLS settings, keep their native contract. Request-only options such as `reset` belong in `request()`.
+
+#### Proxy and connection reuse
 
 ```ts
 const pool = new CallPool({
     baseUrl: "https://api.example.com",
     network: {
-        proxy: "http://user:pass@proxy.example.com:3128",
+        uri: "http://user:pass@proxy.example.com:3128",
+        pipelining: 0, // New connection/tunnel for each HTTP attempt
+        // token: "Basic ...", // Alternative native proxy authentication
     },
 });
-
-// Requests are unchanged: same paths, same options, same responses
-const data = await pool.request("/resource");
 ```
 
-The tunnel is transparent to every pool feature: status codes, headers and latency observed by the pool are those of the **target**, so retry, `Retry-After` handling and adaptive throttling behave exactly as without a proxy. TLS stays end-to-end with the target (the proxy only relays encrypted bytes); `network.tls` options apply to the tunneled connection, not to the proxy hop.
+With Undici's default proxy tunnelling, HTTPS remains encrypted end to end with the target. The pool sees the target's responses and applies the same retry/pause policy. Native `network.headers` are **proxy headers**; use top-level `defaultHeaders` for the target.
 
-Scoped to this pool only: pools without `network.proxy` keep connecting directly. Only `http:`/`https:` proxy URLs are supported (no SOCKS).
+Keep-alive normally reuses a CONNECT tunnel across requests. A rotating proxy that chooses an exit per tunnel will therefore keep that exit while the tunnel is reused, even without a sticky-session identifier. `pipelining: 0` creates fresh connections; alternatively `request(path, { reset: true })` closes the connection after that response. Use reset consistently if every request must close its connection. A fresh tunnel does not guarantee a different public IP: that depends on the proxy provider, eligible exits and session/lease policy. Sticky sessions remain the proxy's responsibility.
 
 #### TLS
 
-Certificates and keys are passed as PEM **content**, never as file paths: read them yourself so your application stays in control of how they are loaded. Passing a path throws at construction time.
-
-| Option                            | Type                                       | Required | Default | Description                                                         |
-| --------------------------------- | ------------------------------------------ | -------- | ------- | ------------------------------------------------------------------- |
-| `network.tls.ca`                  | `string \| Buffer \| Array<string\|Buffer>` | No       | -       | Additional CA certificate(s) trusted by this pool                    |
-| `network.tls.cert`                | `string \| Buffer`                          | No       | -       | Client certificate for mutual TLS (requires `key`)                   |
-| `network.tls.key`                 | `string \| Buffer`                          | No       | -       | Private key for mutual TLS (requires `cert`)                         |
-| `network.tls.passphrase`          | `string`                                   | No       | -       | Passphrase decrypting an encrypted `key`                             |
-| `network.tls.servername`          | `string`                                   | No       | -       | SNI hostname, when it differs from the host in `baseUrl`             |
-| `network.tls.rejectUnauthorized`  | `boolean`                                  | No       | `true`  | Whether the server certificate must validate                         |
-
-These settings apply **only to this pool**. The process-wide trust store is untouched, so every other connection your application makes keeps validating against the system CAs — unlike `NODE_EXTRA_CA_CERTS`, which widens trust for the whole process.
+Use `network.connect` for direct TLS, `network.requestTls` for the target through a proxy, and `network.proxyTls` for an HTTPS proxy hop. Certificates and keys are PEM content, loaded by the caller. Native Undici/Node validation applies; CallPool no longer validates PEM strings itself. Trust remains scoped to each pool.
 
 ```ts
 import { readFileSync } from "node:fs";
 
-// An endpoint whose chain the system CA bundle cannot complete
-const pool = new CallPool({
+const direct = new CallPool({
     baseUrl: "https://api.internal.example.com",
-    network: {
-        tls: { ca: readFileSync("./certs/internal-ca.pem", "utf8") },
-    },
+    network: { connect: { ca: readFileSync("./certs/internal-ca.pem") } },
 });
 
-// Mutual TLS
-const mtlsPool = new CallPool({
+const proxied = new CallPool({
     baseUrl: "https://api.partner.example.com",
     network: {
-        tls: {
-            cert: readFileSync("./certs/client.crt", "utf8"),
-            key: readFileSync("./certs/client.key", "utf8"),
-            passphrase: process.env.CLIENT_KEY_PASSPHRASE,
+        uri: "https://proxy.example.com:3128",
+        proxyTls: { ca: readFileSync("./certs/proxy-ca.pem") },
+        requestTls: {
+            ca: readFileSync("./certs/partner-ca.pem"),
+            cert: readFileSync("./certs/client.crt"),
+            key: readFileSync("./certs/client.key"),
         },
     },
 });
 ```
 
-> `rejectUnauthorized: false` disables certificate verification entirely and exposes the connection to interception. Use it only against a local or disposable environment, never to work around a chain that a proper `ca` would fix.
+### Migrating from 0.7.x to 0.8.0
+
+| Previous configuration | 0.8.0 |
+| --- | --- |
+| `network.proxy` | `network.uri` (native `ProxyAgent`) |
+| `network.timeout` | `network.headersTimeout` and `network.bodyTimeout` |
+| `network.defaultHeaders` | top-level `defaultHeaders` |
+| `network.tls` | `network.connect` directly, or `network.requestTls` through a proxy |
+| `CallPoolTlsOptions` | Undici's native connector/TLS types; `NetworkOptions` is exported |
+| `adaptive.rateLimitSignal.pause` | `retry.pauseCodes: [429]` to enable shared pauses, `[]` to disable |
+
+The removed configuration keys throw a migration error for JavaScript callers instead of being silently ignored. If you used the unreleased `retry.maxElapsedTime` option, move it to top-level `maxElapsedTime` (also available per request).
+
+**Behavior changes:** shared pauses now default to off, including with `adaptive.rateLimitSignal: true`. That option still controls concurrency reduction/recovery only. Enable `retry.pauseCodes: [429]` explicitly to preserve pool-wide waiting. Without a valid `Retry-After`, 429 now uses the same configurable fallback as other failures: 1s, 2s, 4s… capped by `maxDelay`, instead of a hidden 5s fallback. To start at 5s, set `retry.delay: 5000`. Retry backoff is now capped by `maxDelay`; valid `Retry-After` is also honored for configured HTTP failures other than 429. Shared backoff resets on a successful post-pause attempt independently of adaptive recovery.
+
+Native options are tied to the installed Undici major version (currently 6.x). No changes are required in the proxy server to configure client connection reuse.
 
 ## Request
 
@@ -408,10 +487,10 @@ Requests keep their concurrency slot until they finish, including body consumpti
 The latency controller samples successful responses only, so on its own it never sees a 429: the refused request waits its `Retry-After`, and the other slots keep sending at full concurrency. With `adaptive.rateLimitSignal` a 429 steers the whole pool instead:
 
 -   **One cut per episode**: concurrency is multiplied by `decreaseFactor` (never below `minConcurrency`, always at least one slot) and applied at once, without the tuning debounce. Every 429 received before the episode's wait is over extends it without cutting again, so the requests already in flight when the server starts refusing do not drive concurrency to its floor together.
--   **Pause** (`pause: true`): no new HTTP attempt starts — first attempts and retries alike — until the wait the server asked for is over (`Retry-After`, capped at `retry.maxRetryAfter`; 5s when the header is missing). When the header is missing and the server refuses again before the pool has recovered (fewer than `recoveryAfter` successes since the last 429), the pause doubles at every new episode — 5s, 10s, 20s… up to `retry.maxRetryAfter` — because the default wait was evidently too short; an explicit `Retry-After` is always honored as sent. `getStats().pausedFor` reports the time left.
+-   **Separate pause policy**: `retry.pauseCodes` controls shared waiting independently of this signal and of `adaptive.enabled`.
 -   **Recovery hold**: after the last 429 the controller may grow concurrency again only after `recoveryAfter` successful responses; until then the fast responses that would normally signal headroom do not.
 
-The option requires `adaptive.enabled`; it is ignored otherwise.
+The concurrency signal requires `adaptive.enabled`; it is ignored otherwise. Shared pauses do not require either option.
 
 ```typescript
 const pool = new CallPool({
@@ -428,10 +507,10 @@ const pool = new CallPool({
 
 ## Error Handling
 
--   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits exactly that long (capped at `retry.maxRetryAfter`, default 60s) before retrying — no extra backoff is stacked on top. With `adaptive.rateLimitSignal` the 429 also cuts the pool's concurrency and pauses its other requests (see [Rate-limit signal](#rate-limit-signal))
+-   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits exactly that long (capped at `retry.maxRetryAfter`, default 60s) before retrying — no extra backoff is stacked on top. `retry.pauseCodes` optionally pauses other attempts; `adaptive.rateLimitSignal` separately reduces concurrency (see [Rate-limit signal](#rate-limit-signal))
 -   **5xx (Server Error) and 408 (Request Timeout)**: Automatic retry with exponential backoff
--   **Other 4xx (Client Error)**: No retry is performed
--   **Network Error**: Automatic retry with exponential backoff
+-   **Other 4xx (Client Error)**: No retry by default; configurable with `retry.codes`
+-   **Network Error**: Automatic retry with exponential backoff unless `retry.networkErrors: false`
 -   **Invalid local request arguments**: Propagated immediately without retry
 -   **AbortSignal**: Pass an optional `signal` to cancel a logical request, including scheduler queue, quota/`minTime` waits, HTTP/body download, and retry backoff. The rejection preserves `signal.reason`, and an aborted request is never retried. Cancelling while queued removes the job promptly; cancelling while waiting for rate permission releases its concurrency slot without charging that pending permission. An active HTTP attempt keeps its slot until the transport settles. Abort listeners and unused rate wake timers are removed when their waits end.
 
@@ -459,8 +538,8 @@ try {
         err.statusCode; // e.g. 404
         err.body; // raw response body
         err.headers; // response headers (Set-Cookie redacted)
-        err.retryable; // whether the pool retried it
-        err.retryAfterMs; // parsed Retry-After (429 only)
+        err.retryable; // whether policy permits retry, subject to attempts/budget
+        err.retryAfterMs; // parsed/capped valid Retry-After, otherwise undefined
     }
 }
 ```
@@ -489,3 +568,13 @@ Funzionalità pianificate per le prossime versioni:
 ## License
 
 MIT
+
+## Development checks
+
+```sh
+pnpm typecheck
+pnpm test:run       # Unit, integration, local end-to-end and compile-only API tests
+pnpm test:e2e       # HTTPS/CONNECT and 429 recovery end-to-end only
+```
+
+The end-to-end suite requires `openssl` to generate temporary certificates. It starts loopback-only fixtures on ephemeral test ports and does not contact external portals or paid proxies. It verifies actual tunnel reuse and reconnection, TLS trust on each hop, timeout overrides and 429 queue behavior; it does not claim to verify provider public-IP rotation.

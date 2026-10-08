@@ -1,10 +1,16 @@
-import { Dispatcher } from "undici";
+import type { Dispatcher, Pool, ProxyAgent } from "undici";
+
+/** HTTP failures eligible for a retry or a shared pause. */
+export type StatusCodeSelector = number | "4xx" | "5xx";
+
+/** Native constructor options. `uri` selects Undici ProxyAgent instead of Pool. */
+export type NetworkOptions = (Pool.Options & { uri?: never }) | ProxyAgent.Options;
 
 export interface CallPoolOptions {
     /** Base URL for all requests (e.g. "https://api.example.com") */
     baseUrl: string;
 
-    /** Concurrency Configuration (Socket/Queue) */
+    /** Maximum concurrent logical requests (independent of network.connections). */
     concurrency?: {
         limit?: number; // Default: 1
     };
@@ -73,53 +79,45 @@ export interface CallPoolOptions {
         initialConcurrency?: number;
 
         /**
-         * Treats a 429 as a pool-wide signal instead of a per-request one.
-         * Without it a 429 only makes the request that received it wait, while
-         * the other slots keep sending at full concurrency — the latency-based
-         * controller never sees the 429, since it samples successful responses
-         * only. `true` enables the defaults of {@link RateLimitSignalOptions}.
-         * Default: false
+         * Reduces concurrency on 429 and holds recovery for successful responses.
+         * Requires adaptive.enabled. Does not pause the pool: use retry.pauseCodes.
+         * Default: false; true uses RateLimitSignalOptions defaults.
          */
         rateLimitSignal?: boolean | RateLimitSignalOptions;
     };
 
-    /** Retry Configuration (Resilience) */
+    /** Default total budget in ms, from submission including queue and retries.
+     * Positive and finite; omitted means unlimited. Overridable per request.
+     */
+    maxElapsedTime?: number;
+
+    /** Default target request headers; per-request headers override these. */
+    defaultHeaders?: Record<string, string>;
+
+    /** Reactive failure policy, independent of adaptive throttling. */
     retry?: {
-        /** Total number of attempts, including the initial request. Default: 3 */
+        /** Total HTTP attempts including the first. Default: 3 */
         maxAttempts?: number;
+        /** Replaces the default [408, 429, "5xx"]. [] disables HTTP retries. */
+        codes?: readonly StatusCodeSelector[];
+        /** Independent of codes. Holds all new attempts, even after a final failure. Default: [] */
+        pauseCodes?: readonly StatusCodeSelector[];
+        /** Retry transport failures (never cancellation or invalid arguments). Default: true */
+        networkErrors?: boolean;
+        /** Initial fallback wait in ms when Retry-After is absent/invalid. Default: 1000 */
         delay?: number;
+        /** Fallback multiplier per retry / shared pause episode. Default: 2 */
         factor?: number;
-        /**
-         * Upper bound (ms) for the wait honored from a 429 Retry-After header.
-         * Prevents a misbehaving server from parking a concurrency slot for
-         * hours. Default: 60000 (60s)
-         */
+        /** Maximum fallback wait in ms, for retries and pauses. Default: 60000 */
+        maxDelay?: number;
+        /** Maximum wait in ms honored from a valid Retry-After. Default: 60000 */
         maxRetryAfter?: number;
     };
 
-    /** Undici Network Options */
-    network?: {
-        timeout?: number;
-        defaultHeaders?: Record<string, string>;
-        /**
-         * TLS settings for this pool's connections. Scoped to this pool only:
-         * the process-wide trust store is never touched, so every other
-         * connection in the process keeps validating against the system CAs.
-         * With `proxy` set these options apply to the tunneled connection to
-         * `baseUrl`, not to the proxy hop.
-         */
-        tls?: CallPoolTlsOptions;
-        /**
-         * HTTP(S) forward proxy for this pool, as a URL with optional embedded
-         * credentials (`http://user:pass@host:port`). When set, every request
-         * reaches `baseUrl` through a CONNECT tunnel opened on the proxy;
-         * credentials are sent as Proxy-Authorization (Basic). Status codes,
-         * headers and latency observed by the pool remain those of the target,
-         * so retry, Retry-After and adaptive throttling behave as without a
-         * proxy. Scoped to this pool only.
-         */
-        proxy?: string;
-    };
+    /** Native Undici Pool.Options or ProxyAgent.Options, overriding pool defaults.
+     * Request-specific options belong in request(). Proxy headers are proxy-only.
+     */
+    network?: NetworkOptions;
 }
 
 /**
@@ -137,55 +135,10 @@ export interface RateLimitSignalOptions {
     decreaseFactor?: number;
 
     /**
-     * Holds every new HTTP attempt of the pool — not only the retry of the
-     * refused request — until the episode's wait is over: the `Retry-After`
-     * the server sent, or the default wait when it sent none — doubled at every
-     * new episode that starts before the pool has recovered. Default: true
-     */
-    pause?: boolean;
-
-    /**
      * Successful responses required after the last 429 before the controller
      * may grow concurrency again. A non-negative integer. Default: 10
      */
     recoveryAfter?: number;
-}
-
-/**
- * TLS settings applied to the pool's connections.
- *
- * Certificates and keys are passed as PEM **content**, not as file paths:
- * read them yourself (e.g. `readFileSync(path, "utf8")`) so the caller stays
- * in control of how they are loaded.
- */
-export interface CallPoolTlsOptions {
-    /**
-     * Additional CA certificate(s) trusted by this pool, in PEM format.
-     * Replaces the default CA bundle for these connections, so include every
-     * certificate needed to complete the chain.
-     */
-    ca?: string | Buffer | Array<string | Buffer>;
-
-    /** Client certificate (PEM) for mutual TLS. Requires `key`. */
-    cert?: string | Buffer;
-
-    /** Private key (PEM) for mutual TLS. Requires `cert`. */
-    key?: string | Buffer;
-
-    /** Passphrase decrypting an encrypted `key` */
-    passphrase?: string;
-
-    /** SNI hostname, when it differs from the host in `baseUrl` */
-    servername?: string;
-
-    /**
-     * Whether the server certificate must validate. Default: `true`.
-     * Setting this to `false` disables certificate verification entirely and
-     * exposes the connection to interception: use it only against a local or
-     * disposable environment, never to work around a chain that a proper `ca`
-     * would fix.
-     */
-    rejectUnauthorized?: boolean;
 }
 
 /**
@@ -196,6 +149,8 @@ export interface CallPoolTlsOptions {
 export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin" | "path" | "method" | "body" | "headers" | "signal" | "throwOnError"> {
     method?: Dispatcher.HttpMethod;
     priority?: number;
+    /** Total budget from submission; overrides the pool default. Positive finite ms. */
+    maxElapsedTime?: number;
     body?: string | Buffer | Uint8Array | object | null;
     headers?: Record<string, string>;
     /**
@@ -264,6 +219,6 @@ export interface CallPoolStats {
     running: number;
     /** Current concurrency limit (dynamically tuned when adaptive is enabled) */
     concurrency: number;
-    /** Milliseconds left before new attempts may start after a 429 (`rateLimitSignal.pause`), 0 otherwise */
+    /** Milliseconds left before new attempts may start after a matching `retry.pauseCodes` response, 0 otherwise */
     pausedFor: number;
 }

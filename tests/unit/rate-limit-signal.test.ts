@@ -36,7 +36,7 @@ describe("adaptive.rateLimitSignal", () => {
         const pool = new CallPool({
             baseUrl,
             concurrency: { limit: 8 },
-            adaptive: { enabled: true, rateLimitSignal: { pause: false, decreaseFactor: 0.5 } },
+            adaptive: { enabled: true, rateLimitSignal: { decreaseFactor: 0.5 } },
             retry: { maxAttempts: 2 },
         });
         try {
@@ -52,7 +52,7 @@ describe("adaptive.rateLimitSignal", () => {
         const pool = new CallPool({
             baseUrl,
             concurrency: { limit: 4 },
-            adaptive: { enabled: true, minConcurrency: 3, rateLimitSignal: { pause: false, decreaseFactor: 0.1 } },
+            adaptive: { enabled: true, minConcurrency: 3, rateLimitSignal: { decreaseFactor: 0.1 } },
             retry: { maxAttempts: 2 },
         });
         try {
@@ -69,7 +69,7 @@ describe("adaptive.rateLimitSignal", () => {
             baseUrl,
             concurrency: { limit: 4 },
             adaptive: { enabled: true, rateLimitSignal: true },
-            retry: { maxAttempts: 2 },
+            retry: { pauseCodes: [429], delay: 5000, maxAttempts: 2 },
         });
         try {
             const first = pool.request("/refused");
@@ -88,20 +88,20 @@ describe("adaptive.rateLimitSignal", () => {
     }, 10_000);
 
     it("doubles the pause when a server that names no wait refuses again before recovery", async () => {
-        // No Retry-After: the default wait (5s) is the server's only hint.
+        // No Retry-After: the configured fallback doubles on repeated refusals.
         const { server, baseUrl, arrivals } = await rateLimitedServer(2, "", 5);
         const pool = new CallPool({
             baseUrl,
             concurrency: { limit: 2 },
             adaptive: { enabled: true, rateLimitSignal: true },
-            retry: { maxAttempts: 3 },
+            retry: { pauseCodes: [429], delay: 100, maxAttempts: 3 },
         });
         try {
             await pool.request("/refused-twice");
             const gaps = arrivals.slice(1).map((at, i) => at - arrivals[i]);
-            expect(gaps[0]).toBeGreaterThanOrEqual(4950);
-            expect(gaps[0]).toBeLessThan(6500);
-            expect(gaps[1]).toBeGreaterThanOrEqual(9950);
+            expect(gaps[0]).toBeGreaterThanOrEqual(100);
+            expect(gaps[0]).toBeLessThan(1500);
+            expect(gaps[1]).toBeGreaterThanOrEqual(200);
         } finally {
             await Promise.all([pool.close(), server.stop()]);
         }
@@ -113,7 +113,7 @@ describe("adaptive.rateLimitSignal", () => {
             baseUrl,
             concurrency: { limit: 2 },
             adaptive: { enabled: true, rateLimitSignal: true },
-            retry: { maxAttempts: 3 },
+            retry: { pauseCodes: [429], delay: 100, maxAttempts: 3 },
         });
         try {
             await pool.request("/refused-twice");
@@ -131,7 +131,7 @@ describe("adaptive.rateLimitSignal", () => {
         const pool = new CallPool({
             baseUrl,
             concurrency: { limit: 8 },
-            adaptive: { enabled: true, rateLimitSignal: { pause: false, decreaseFactor: 0.5, recoveryAfter: 3 } },
+            adaptive: { enabled: true, rateLimitSignal: { decreaseFactor: 0.5, recoveryAfter: 3 } },
             retry: { maxAttempts: 2 },
         });
         try {
@@ -150,7 +150,7 @@ describe("adaptive.rateLimitSignal", () => {
         const pool = new CallPool({
             baseUrl,
             concurrency: { limit: 6 },
-            adaptive: { enabled: true, rateLimitSignal: { pause: false } },
+            adaptive: { enabled: true, rateLimitSignal: {} },
             retry: { maxAttempts: 1 },
         });
         try {
@@ -183,6 +183,6 @@ describe("adaptive.rateLimitSignal", () => {
         expect(adaptive({ recoveryAfter: 1.5 })).toThrow("'adaptive.rateLimitSignal.recoveryAfter'");
         expect(adaptive({ pause: "yes" })).toThrow("'adaptive.rateLimitSignal.pause'");
         expect(adaptive("on")).toThrow("'adaptive.rateLimitSignal' must be a boolean or an object");
-        expect(adaptive({ decreaseFactor: 0.7, pause: false, recoveryAfter: 0 })).not.toThrow();
+        expect(adaptive({ decreaseFactor: 0.7, recoveryAfter: 0 })).not.toThrow();
     });
 });
