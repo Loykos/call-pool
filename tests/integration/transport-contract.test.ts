@@ -40,6 +40,21 @@ function startServer(): Promise<{ server: Server; baseUrl: string; active: () =>
                 case "/slow":
                     setTimeout(() => res.end("late"), Number(url.searchParams.get("ms") ?? 3_000));
                     return;
+                case "/slow-body": {
+                    const sendHeaders = () => {
+                        res.writeHead(200, { "content-type": "text/plain" });
+                        res.write("first");
+                    };
+                    const headersMs = Number(url.searchParams.get("headersMs") ?? 0);
+                    const headersTimer = headersMs > 0 ? setTimeout(sendHeaders, headersMs) : undefined;
+                    if (headersMs === 0) sendHeaders();
+                    const bodyTimer = setTimeout(() => res.end("last"), Number(url.searchParams.get("ms") ?? 400));
+                    res.once("close", () => {
+                        clearTimeout(headersTimer);
+                        clearTimeout(bodyTimer);
+                    });
+                    return;
+                }
                 default:
                     res.statusCode = 404;
                     return res.end("not found");
@@ -116,27 +131,39 @@ describe.each(TRANSPORTS)("transport contract: %s", (_name, transport) => {
         } finally { await single.close(); }
     });
 
-    // impit cannot stop a request before its headers: its slot and close() must wait for the exchange
+    // Headers and body must both finish before a cancelled exchange releases its slot.
     it.each([
-        ["the deadline", () => ({ maxElapsedTime: 30 })],
-        ["the caller's abort", () => ({ signal: AbortSignal.timeout(30) })],
-    ])("settles at %s at once, and close() waits for the exchange to end", async (_cause, options) => {
+        ["the deadline before headers", () => ({ maxElapsedTime: 30 }), "/slow?ms=400"],
+        ["the caller's abort before headers", () => ({ signal: AbortSignal.timeout(30) }), "/slow?ms=400"],
+        ["the deadline before a slow body's headers", () => ({ maxElapsedTime: 30 }), "/slow-body?headersMs=100"],
+        ["the deadline during the body", () => ({ maxElapsedTime: 80 }), "/slow-body"],
+        ["the caller's abort during the body", () => ({ signal: AbortSignal.timeout(80) }), "/slow-body"],
+        ["the deadline during a binary read", () => ({ maxElapsedTime: 80, binary: true }), "/slow-body"],
+    ] as const)("settles at %s at once, and close() waits for the exchange to end", async (_cause, options, path) => {
         const single = new CallPool({ baseUrl, retry: { maxAttempts: 1 }, transport: transport() });
         const started = performance.now();
-        await expect(single.request("/slow?ms=400", options())).rejects.toBeDefined();
-        expect(performance.now() - started).toBeLessThan(200);
-        await single.close();
-        await expect.poll(active, { timeout: 100 }).toBe(0);
+        try {
+            await expect(single.request(path, options())).rejects.toBeDefined();
+            expect(performance.now() - started).toBeLessThan(200);
+            await single.close();
+            await expect.poll(active, { timeout: 100 }).toBe(0);
+        } finally {
+            await single.close();
+            await expect.poll(active, { timeout: 1_000 }).toBe(0);
+        }
     });
 
-    it("keeps the concurrency limit across cancelled exchanges", async () => {
+    it.each(["/slow?ms=400", "/slow-body"])("keeps the concurrency limit across cancelled exchanges on %s", async path => {
         const single = new CallPool({ baseUrl, retry: { maxAttempts: 1 }, transport: transport() });
         try {
             for (let i = 0; i < 3; i++) {
-                await expect(single.request("/slow?ms=400", { maxElapsedTime: 30 })).rejects.toBeInstanceOf(CallPoolTimeoutError);
+                await expect(single.request(path, { maxElapsedTime: 80 })).rejects.toBeInstanceOf(CallPoolTimeoutError);
                 expect(active()).toBeLessThanOrEqual(1);
             }
-        } finally { await single.close(); }
+        } finally {
+            await single.close();
+            await expect.poll(active, { timeout: 1_000 }).toBe(0);
+        }
         await expect.poll(active, { timeout: 100 }).toBe(0);
     });
 

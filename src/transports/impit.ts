@@ -1,5 +1,5 @@
 import { Impit, type HttpMethod, type ImpitOptions, type ImpitResponse, type RequestInit } from "impit";
-import { fetchTransport, type FetchLike, type FetchTransportOptions } from "./fetch.js";
+import { fetchTransport, type FetchLike, type FetchResponseLike, type FetchTransportOptions } from "./fetch.js";
 import type { TransportFactory } from "./transport.js";
 
 /**
@@ -21,8 +21,7 @@ const FATAL_ERRORS = new Set([
 ]);
 
 /**
- * Native bound of every exchange, as Undici's 30 s header and body timeouts:
- * impit has none, and cannot stop a request before its headers.
+ * Default native budget for the request and its body read.
  * `RequestOptions.timeout` overrides it per attempt.
  */
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -60,22 +59,26 @@ export function impitTransport({ proxyUrl, rotateOn, init, timeout = DEFAULT_TIM
 }
 
 /**
- * Settles when the exchange ends, so the pool holds its slot until then: an
- * abort before the headers only settles impit's promise while the native request
- * runs on, so impit gets the abort once the headers are in, where it stops the body.
+ * Keep the native exchange observable through the whole body: impit's abort
+ * can reject its reads while I/O continues. The pool already settles the caller
+ * at cancellation; the body read keeps the slot until EOF or a native read error.
  */
-async function exchange(client: Impit, url: string, init: RequestInit, signal: AbortSignal): Promise<ImpitResponse> {
-    const body = new AbortController();
+async function exchange(client: Impit, url: string, init: RequestInit, signal: AbortSignal): Promise<FetchResponseLike> {
+    signal.throwIfAborted();
     let response: ImpitResponse;
     try {
-        response = await client.fetch(url, { ...init, signal: body.signal });
+        response = await client.fetch(url, init);
     } catch (error) {
         signal.throwIfAborted();
         throw error;
     }
-    const forward = () => body.abort(signal.reason);
-    if (signal.aborted) forward();
-    else signal.addEventListener("abort", forward, { once: true });
-    signal.throwIfAborted();
-    return response;
+    const read = <T>(result: Promise<T>): Promise<T> => result.finally(() => signal.throwIfAborted());
+    // A cancellation before headers must also drain the body before rejecting.
+    if (signal.aborted) await read(response.arrayBuffer());
+    return {
+        status: response.status,
+        headers: response.headers,
+        text: () => read(response.text()),
+        arrayBuffer: () => read(response.arrayBuffer()),
+    };
 }

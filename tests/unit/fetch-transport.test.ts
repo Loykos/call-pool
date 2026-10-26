@@ -81,6 +81,27 @@ describe("fetchTransport", () => {
         } finally { await pool.close(); }
     });
 
+    it("keeps long attempt timeouts instead of overflowing Node's timer", async () => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+        const { fetch, calls } = fakeFetch(untilAborted);
+        const pool = new CallPool({ baseUrl: "https://api.example.com", retry: { maxAttempts: 1 }, transport: fetchTransport(fetch) });
+        const controller = new AbortController();
+        const timeout = 2_147_483_647 + 100;
+        try {
+            const pending = pool.request("/", { timeout, signal: controller.signal }).catch(error => error);
+            await vi.advanceTimersByTimeAsync(2_147_483_647);
+            expect(calls).toHaveLength(1);
+            expect(calls[0].init.signal.aborted).toBe(false);
+            await vi.advanceTimersByTimeAsync(100);
+            expect(await pending).toMatchObject({ name: "TransportTimeoutError", timeout });
+            expect(vi.getTimerCount()).toBe(0);
+        } finally {
+            controller.abort();
+            await pool.close();
+            vi.useRealTimers();
+        }
+    });
+
     it("builds a new client from the factory before every retry rotateOn selects", async () => {
         let built = 0;
         const statuses = [403, 503, 200];

@@ -1,6 +1,8 @@
 import { untilAborted } from "../abort.js";
 import type { RetryContext, Transport, TransportFactory } from "./transport.js";
 
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 /**
  * What the pool sets on every attempt, on top of the environment's `RequestInit`
  * (Node's or DOM's), so the global `fetch` fits either way.
@@ -132,8 +134,21 @@ function attemptSignal(signal: AbortSignal | undefined, timeout: number | undefi
     const forward = () => controller.abort(signal?.reason);
     if (signal?.aborted) forward();
     signal?.addEventListener("abort", forward, { once: true });
-    const timer = timeout === undefined ? undefined : setTimeout(() => controller.abort(new TransportTimeoutError(timeout)), timeout);
-    timer?.unref?.();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (timeout !== undefined) {
+        const expiresAt = performance.now() + timeout;
+        const armTimer = () => {
+            const remaining = expiresAt - performance.now();
+            if (remaining <= 0) {
+                controller.abort(new TransportTimeoutError(timeout));
+                return;
+            }
+            // Node turns delays beyond this limit into 1 ms; keep the original deadline.
+            timer = setTimeout(armTimer, Math.min(remaining, MAX_TIMER_DELAY_MS));
+            timer.unref?.();
+        };
+        armTimer();
+    }
     return {
         signal: controller.signal,
         dispose: () => {
