@@ -114,13 +114,25 @@ describe("fetchTransport", () => {
         } finally { await pool.close(); }
     });
 
-    it("never retries a path that is no URL, or an error the client calls fatal", async () => {
+    it("never retries an error the client calls fatal", async () => {
         const fatal = new Error("unsupported option");
         const { fetch, calls } = fakeFetch(() => { throw fatal; });
         const pool = new CallPool({ baseUrl: "https://api.example.com", retry: { delay: 0 }, transport: fetchTransport(fetch, { isFatal: error => error === fatal }) });
         try {
-            await expect(pool.request("http://[bad")).rejects.toMatchObject({ code: "ERR_INVALID_URL" });
             await expect(pool.request("/")).rejects.toBe(fatal);
+            expect(calls).toHaveLength(1);
+        } finally { await pool.close(); }
+    });
+
+    it("keeps every request on the pool's origin", async () => {
+        const { fetch, calls } = fakeFetch();
+        const pool = new CallPool({ baseUrl: "https://api.example.com", defaultHeaders: { authorization: "Bearer secret" }, retry: { delay: 0 }, transport: fetchTransport(fetch) });
+        try {
+            await pool.request("//other.example/x");
+            expect(calls[0].url).toBe("https://api.example.com//other.example/x");
+            for (const path of ["https://other.example/x", "\\\\other.example/x", "\\other.example", "relative", ""]) {
+                await expect(pool.request(path)).rejects.toMatchObject({ name: "CallPoolError", retryable: false, message: expect.stringContaining('path must start with "/"') });
+            }
             expect(calls).toHaveLength(1);
         } finally { await pool.close(); }
     });

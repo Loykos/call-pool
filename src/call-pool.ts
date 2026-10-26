@@ -7,7 +7,8 @@ import { CircuitBreaker } from "./circuit-breaker.js";
 import { isNamedStatus, matchesCode, parseRetryAfter } from "./http-policy.js";
 import { RequestDeadline } from "./request-deadline.js";
 import { validateOptions, validateMaxElapsedTime, validateResolveStatus, validateTimeout } from "./validation.js";
-import { undiciTransport, type Transport } from "./transport.js";
+import type { Transport } from "./transports/transport.js";
+import { undiciTransport } from "./transports/undici.js";
 
 /** Per-request options left after the pool-level keys are extracted. */
 type TransportOptions = Omit<RequestOptions, "priority" | "response" | "exposeCookies" | "maxElapsedTime" | "resolveStatus">;
@@ -282,9 +283,8 @@ export class CallPool {
             const response = await this.client.request({
                 path,
                 // Built only by transports that read it: Undici takes `path` and keeps its own validation.
-                // A "//host" path stays a path on the origin, never another host.
                 get url() {
-                    return new URL(path.startsWith("/") ? origin + path : path, origin);
+                    return originUrl(origin, path);
                 },
                 method,
                 headers,
@@ -593,4 +593,16 @@ export class CallPool {
         await this.scheduler.stop();
         await this.client.close();
     }
+}
+
+/**
+ * `path` on the pool's origin, for transports that take a full URL. The URL is
+ * built by concatenation, so "//host", "\\host" or an absolute URL can never
+ * name another host; a path that does not start with "/" is rejected, as Undici
+ * rejects it. Never retried: every attempt would fail the same way.
+ */
+function originUrl(origin: string, path: string): URL {
+    const url = path.startsWith("/") ? new URL(origin + path) : undefined;
+    if (url?.origin === origin) return url;
+    throw new CallPoolError(`[CallPool] path must start with "/" and stay on ${origin}: ${path.slice(0, 100)}`, { retryable: false });
 }
