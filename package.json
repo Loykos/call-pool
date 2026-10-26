@@ -10,6 +10,11 @@
             "types": "./dist/index.d.ts",
             "import": "./dist/index.js",
             "default": "./dist/index.js"
+        },
+        "./impit": {
+            "types": "./dist/impit-transport.d.ts",
+            "import": "./dist/impit-transport.js",
+            "default": "./dist/impit-transport.js"
         }
     },
     "files": [
@@ -41,7 +46,9 @@
         "rate-limit",
         "throttle",
         "retry",
-        "undici"
+        "undici",
+        "impit",
+        "transport"
     ],
     "author": "Andrea Moraglia (https://github.com/Loykos)",
     "license": "MIT",
@@ -60,9 +67,18 @@
     "dependencies": {
         "undici": "^6.28.1"
     },
+    "peerDependencies": {
+        "impit": ">=0.14.0 <1"
+    },
+    "peerDependenciesMeta": {
+        "impit": {
+            "optional": true
+        }
+    },
     "devDependencies": {
         "@types/node": "^20.0.0",
         "@vitest/coverage-v8": "^3.2.7",
+        "impit": "0.14.7",
         "tsx": "^4.7.0",
         "typescript": "^5.0.0",
         "vitest": "^3.2.7"

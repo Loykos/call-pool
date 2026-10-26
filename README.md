@@ -14,7 +14,7 @@ The tool uses a **Real-Time Adaptive Throttling** feature (based on the **EMA al
 
 ## Features
 
--   **HTTP Connection Pool**: Uses [`undici`](https://github.com/nodejs/undici) to efficiently manage TCP connections
+-   **Pluggable Transports**: [`undici`](https://github.com/nodejs/undici) connection pools by default, [`impit`](https://github.com/apify/impit) for browser TLS/HTTP2 fingerprints, or any Fetch API client — with the same pacing, retry and circuit policies
 -   **Rate Limiting**: In-process priority scheduler with precise quota management, supporting both fixed windows and "auto" distribution
 -   **Adaptive Throttling**: Real-time latency monitoring. It automatically slows down when the upstream service starts to lag, preventing 429s and timeouts
 -   **Automatic Retry**: Built-in exponential backoff for network and server errors, with `Retry-After` header and `AbortSignal` support
@@ -35,7 +35,7 @@ pnpm install call-pool
 Minimal configuration with only the base URL. Uses default values for all options.
 
 ```typescript
-import { CallPool } from "call-pool";
+import { CallPool, undiciTransport } from "call-pool";
 
 const pool = new CallPool({
     baseUrl: "https://api.example.com",
@@ -82,7 +82,7 @@ await pool.close();
 
 ### All defaults
 
-`baseUrl` is required and has no default. Below are all CallPool defaults; additional `network` options retain Undici's defaults. `initialConcurrency` and `network.connections` follow the configured `concurrency.limit` unless explicitly overridden.
+`baseUrl` is required and has no default. Below are all CallPool defaults; additional Undici options retain Undici's defaults. `initialConcurrency` and the transport's `connections` follow the configured `concurrency.limit` unless explicitly overridden.
 
 ```typescript
 import { CallPool } from "call-pool";
@@ -126,13 +126,15 @@ const pool = new CallPool({
             successThreshold: 2,
         },
     },
-    network: {
-        connections: 1,
-        pipelining: 1,
-        keepAliveTimeout: 10_000,
-        headersTimeout: 30_000,
-        bodyTimeout: 30_000,
-    },
+    transport: undiciTransport({
+        network: {
+            connections: 1,
+            pipelining: 1,
+            keepAliveTimeout: 10_000,
+            headersTimeout: 30_000,
+            bodyTimeout: 30_000,
+        },
+    }),
 });
 
 // Usage examples
@@ -165,6 +167,7 @@ await pool.close();
 | `baseUrl` | `string` | Yes      | -       | Base URL for all requests |
 | `defaultHeaders` | `Record<string, string>` | No | `{}` | Target request headers; per-request headers override them case-insensitively |
 | `maxElapsedTime` | `number` | No | unlimited | Positive finite total request budget in ms, including queue; overridable per request |
+| `transport` | `TransportFactory` | No | `undiciTransport()` | How requests reach the host; see [Transports](#transports) |
 
 ### Concurrency Configuration
 
@@ -328,7 +331,75 @@ A resolver that throws, or returns anything else, rejects the request with a non
 
 With a resolver, adaptive feedback waits for its verdict: the TTFB sample and the rate-limit recovery count are applied once the body is read, and only when the resolved status succeeds. Without one, they still happen as soon as the headers arrive.
 
+### Transports
+
+The pool decides **when** and **how many** requests run, and what happens when they fail: concurrency, rate limit and quota, adaptive throttling, retries, circuit breaker, status resolution, deadlines and cancellation. The transport decides **how** a request reaches the host: connections, proxy, TLS, HTTP version, redirects, decompression and which client errors are worth retrying. Pass one with `transport`; every pool option works the same whatever the transport.
+
+| Transport | Import | Use it for |
+| --- | --- | --- |
+| `undiciTransport({ network })` | `call-pool` | The default: an Undici `Pool`, or a `ProxyAgent` when `network.uri` is set. Takes the [network options](#network-configuration). |
+| `impitTransport(options)` | `call-pool/impit` | [impit](https://github.com/apify/impit) requests with a browser's TLS and HTTP/2 fingerprint. Requires `impit` installed next to `call-pool`. |
+| `fetchTransport(fetch, options)` | `call-pool` | Any client with a Fetch API `fetch(url, init)`: the global `fetch`, `undici.fetch` and similar. |
+
+```ts
+import { CallPool, undiciTransport, fetchTransport } from "call-pool";
+import { impitTransport } from "call-pool/impit";
+
+// Default: identical to omitting `transport`
+new CallPool({ baseUrl: "https://api.example.com", transport: undiciTransport() });
+
+// Undici with native options (the deprecated `network` option)
+new CallPool({
+    baseUrl: "https://api.example.com",
+    transport: undiciTransport({ network: { uri: "http://proxy.example.com:3128", pipelining: 0 } }),
+});
+
+// impit with a Chrome fingerprint, on a new proxy for every retry
+new CallPool({
+    baseUrl: "https://api.example.com",
+    retry: { codes: [403, 429, "5xx"], delay: 0 },
+    transport: impitTransport({ browser: "chrome", timeout: 15_000, proxyUrl: () => proxies.next() }),
+});
+
+// Any Fetch API client
+new CallPool({ baseUrl: "https://api.example.com", transport: fetchTransport(fetch) });
+```
+
+**Rotation.** Before every retry the pool calls the transport's `rotate`. `impitTransport` and a `fetchTransport` built from a factory create a new client there: with `proxyUrl` (impit) or your factory returning a client bound to the next proxy, each retry leaves from a new exit. `rotateOn` narrows it to the retries you choose, e.g. `({ status }) => status === 403`. Undici rotates nothing: use `pipelining: 0` or `reset: true` for a new connection.
+
+```ts
+// A Fetch client rebuilt before every retry
+const transport = fetchTransport({ create: async () => makeClient({ proxy: await proxies.next() }) }, { rotateOn: ({ status }) => status !== 404 });
+```
+
+**Behavior shared by the built-in transports**, verified by one contract suite against a local server:
+
+- redirects are returned as responses, never followed (`fetchTransport` sends `redirect: "manual"`; pass `redirect: "follow"` to change it);
+- header names are lowercase and `Set-Cookie` is an array, redacted unless `exposeCookies`;
+- binary bodies keep their bytes;
+- `RequestOptions.timeout` bounds one attempt and the timed-out attempt is retried as a transport error. Undici checks it on its ~1 s timer ticks, so short timeouts fire late; Fetch clients abort on time;
+- the caller's `signal` and `maxElapsedTime` cancel the request, including the body download;
+- client errors that a retry cannot fix (invalid arguments or URL, refused proxy credentials, misused bodies) are rejected at once.
+
+`connections` and the other socket options belong to Undici. Fetch clients and impit manage their own connections: the pool still bounds the requests in flight with `concurrency.limit`.
+
+**Your own transport.** A transport is a factory receiving the pool's `origin` and `connections`, returning an object with `request`, `close` and the optional `rotate` and `isFatal`. `request` resolves once status and headers are in, with a body read on demand:
+
+```ts
+import type { TransportFactory } from "call-pool";
+
+const custom: TransportFactory = ({ origin }) => ({
+    async request({ url, method, headers, body, signal, timeout }) {
+        const res = await myClient.send({ url: url.href, method, headers, body, signal, timeout });
+        return { statusCode: res.status, headers: res.headers, body: { text: async () => res.text, arrayBuffer: async () => res.bytes } };
+    },
+    close: async () => myClient.close(),
+});
+```
+
 ### Network Configuration
+
+> **Deprecated since 0.10.0.** `network` still works and is the same as `transport: undiciTransport({ network })`. Pass the options to `undiciTransport` instead; `network` is removed in 1.0 and cannot be combined with `transport`.
 
 `network` accepts native Undici `Pool.Options` for direct connections, or `ProxyAgent.Options` when `uri` is present. Values are forwarded to the selected constructor without renaming or filtering; native validation and semantics apply. Some transport validation happens on the first request.
 
@@ -386,6 +457,15 @@ const proxied = new CallPool({
     },
 });
 ```
+
+### Migrating from 0.9.x to 0.10.0
+
+| Previous configuration | 0.10.0 |
+| --- | --- |
+| `network: { ... }` | `transport: undiciTransport({ network: { ... } })` (`network` still works, deprecated) |
+| `request(path, { headersTimeout, bodyTimeout })` | Still supported for Undici; `request(path, { timeout })` works with every transport |
+
+No behavior changes for pools without `transport`: the default transport is the Undici pool of 0.9.
 
 ### Migrating from 0.7.x to 0.8.0
 
@@ -504,13 +584,14 @@ const newUser = await pool.request<User>("/users", {
 | `body`          | `string \| Buffer \| Uint8Array \| object \| null` | No       | -        | Request body (JS objects are automatically serialized to JSON)  |
 | `headers`       | `Record<string, string>`                           | No       | -        | Additional headers for the single request                       |
 | `signal`        | `AbortSignal \| null`                              | No       | -        | Cancels queued work, quota/minTime waits, HTTP and retries        |
+| `timeout`       | `number`                                           | No       | transport's | Budget of one attempt in ms, for any [transport](#transports)  |
 | `response`      | `"body" \| "raw"`                                  | No       | `"body"` | `"raw"` resolves with a `{ status, headers, body }` envelope    |
 | `exposeCookies` | `boolean`                                          | No       | `false`  | Reveals `Set-Cookie` in the raw envelope (redacted by default)  |
 | `resolveStatus` | `ResolveStatus`                                    | No       | pool's   | Overrides the pool's [status resolution](#status-resolution)    |
 
-Header names are matched case-insensitively: request headers override `network.defaultHeaders`, so `authorization` replaces a default `Authorization`. If the same name appears with different casing within either object, the last entry wins. Each header name is sent once, and the input objects are left untouched.
+Header names are matched case-insensitively: request headers override `defaultHeaders`, so `authorization` replaces a default `Authorization`. If the same name appears with different casing within either object, the last entry wins. Each header name is sent once, and the input objects are left untouched.
 
-Every other [undici `RequestOptions`](https://github.com/nodejs/undici/blob/main/docs/docs/api/Dispatcher.md#parameter-requestoptions) field (`query`, `maxRedirections`, `idempotent`, `headersTimeout`, ...) is passed through 1:1, except `throwOnError`, which is excluded because it would bypass the pool's error and retry policy.
+Every other [undici `RequestOptions`](https://github.com/nodejs/undici/blob/main/docs/docs/api/Dispatcher.md#parameter-requestoptions) field (`query`, `maxRedirections`, `idempotent`, `headersTimeout`, ...) is passed through 1:1 to the transport, except `throwOnError`, which is excluded because it would bypass the pool's error and retry policy. `undiciTransport` applies them; the other transports ignore the ones they do not know.
 
 ### Raw Responses
 
@@ -618,13 +699,14 @@ try {
 }
 ```
 
-Network-level failures (DNS, connection reset, socket timeout) propagate as the original `undici` errors.
+Network-level failures (DNS, connection reset, socket timeout) propagate as the transport's original errors: `undici` errors with the default transport, impit's or the Fetch client's otherwise, and `TransportTimeoutError` when a Fetch client exceeds `timeout`.
 
 **Backpressure note**: retry waits (backoff and `Retry-After`) happen while the logical request still occupies its concurrency slot. A retrying request therefore slows the whole pool down — intentional backpressure that prevents hammering a struggling upstream. Rate limits are acquired separately for every HTTP attempt, so retries count against `minTime` and quota just like initial attempts.
 
 ## Dependencies
 
--   `undici`: High-performance HTTP connection pool
+-   `undici`: High-performance HTTP connection pool, the default transport
+-   `impit` (optional peer dependency): only for `call-pool/impit`
 
 Rate limiting, priority queueing and quota management are implemented in-process with zero additional dependencies.
 

@@ -1,4 +1,5 @@
 import type { Dispatcher, Pool, ProxyAgent } from "undici";
+import type { TransportFactory } from "./transport.js";
 
 type Letter = "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z";
 
@@ -150,8 +151,21 @@ export interface CallPoolOptions {
     /** Pool-wide HTTP failure protection; open circuits retain waiting work. */
     circuitBreaker?: CircuitBreakerOptions;
 
-    /** Native Undici Pool.Options or ProxyAgent.Options, overriding pool defaults.
+    /**
+     * How requests reach the host: connections, proxy, TLS, redirects and the
+     * classification of transport errors. The pool keeps pacing, retries,
+     * circuit breaker, status resolution and deadlines whatever the transport.
+     * Default: `undiciTransport()`. Built-ins: `undiciTransport`,
+     * `fetchTransport` (any Fetch API client) and `impitTransport` from
+     * `call-pool/impit` (browser fingerprints).
+     */
+    transport?: TransportFactory;
+
+    /**
+     * Native Undici Pool.Options or ProxyAgent.Options, overriding pool defaults.
      * Request-specific options belong in request(). Proxy headers are proxy-only.
+     * Cannot be combined with `transport`.
+     * @deprecated Since 0.10: use `transport: undiciTransport({ network })`. Removed in 1.0.
      */
     network?: NetworkOptions;
 }
@@ -199,6 +213,7 @@ export interface RateLimitSignalOptions {
 }
 
 /**
+ * The Undici fields are a passthrough for `undiciTransport`; other transports ignore them.
  * `throwOnError` is excluded from the undici passthrough: undici would reject
  * with its own ResponseStatusCodeError before the pool's error/retry policy
  * runs, silently retrying non-retryable 4xx responses.
@@ -206,6 +221,12 @@ export interface RateLimitSignalOptions {
 export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin" | "path" | "method" | "body" | "headers" | "signal" | "throwOnError"> {
     method?: Dispatcher.HttpMethod;
     priority?: number;
+    /**
+     * Budget of one attempt in ms, for any transport: Undici's `headersTimeout`
+     * and `bodyTimeout` (which win when also set), the whole exchange for Fetch
+     * clients. A timed-out attempt is retried as a transport error.
+     */
+    timeout?: number;
     /** Total budget from submission; overrides the pool default. Positive finite ms. */
     maxElapsedTime?: number;
     /** Overrides the pool's `resolveStatus` for this request. */

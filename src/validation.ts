@@ -17,6 +17,12 @@ export function validateOptions(options: CallPoolOptions): void {
         throw new Error("[CallPool] 'concurrency.limit' must be a positive integer");
     }
 
+    if (options.transport !== undefined && typeof options.transport !== "function") {
+        throw new Error("[CallPool] 'transport' must be a transport factory, e.g. undiciTransport()");
+    }
+    if (options.transport !== undefined && options.network !== undefined) {
+        throw new Error("[CallPool] 'network' cannot be combined with 'transport': use undiciTransport({ network })");
+    }
     validateMaxElapsedTime(options.maxElapsedTime);
     validateResolveStatus(options.resolveStatus, "resolveStatus");
     // Removed aliases must not silently bypass proxy/TLS/timeout configuration
@@ -33,6 +39,12 @@ export function validateOptions(options: CallPoolOptions): void {
     validateRetryOptions(options.retry);
     validateAdaptiveOptions(options.adaptive, concurrencyLimit);
     validateCircuitBreaker(options.circuitBreaker);
+}
+
+export function validateTimeout(value: number | undefined): void {
+    if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+        throw new Error("[CallPool] 'timeout' must be a positive finite number");
+    }
 }
 
 export function validateMaxElapsedTime(value: number | undefined): void {
