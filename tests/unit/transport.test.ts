@@ -109,6 +109,23 @@ describe("transport", () => {
         } finally { await pool.close(); }
     });
 
+    it("settles the caller at its abort, and keeps the slot and close() until the transport's request settles", async () => {
+        let release!: () => void;
+        const settled = new Promise<void>(resolve => { release = resolve; });
+        // A client that cannot stop a request before its headers (impit): it settles only when the exchange ends
+        const { factory } = fakeTransport([], { request: () => settled.then(() => { throw new Error("aborted late"); }) });
+        const pool = new CallPool({ baseUrl: "https://example.com", retry: { maxAttempts: 1 }, transport: factory });
+        await expect(pool.request("/", { maxElapsedTime: 20 })).rejects.toBeInstanceOf(CallPoolTimeoutError);
+        expect(pool.getStats().running).toBe(1);
+        let closed = false;
+        const closing = pool.close().then(() => { closed = true; });
+        await new Promise(resolve => setTimeout(resolve, 20));
+        expect(closed).toBe(false);
+        release();
+        await closing;
+        expect(pool.getStats().running).toBe(0);
+    });
+
     it("does not rotate when the failure is not retried", async () => {
         const { factory, rotations } = fakeTransport([404]);
         const pool = new CallPool({ baseUrl: "https://example.com", retry: { delay: 0 }, transport: factory });

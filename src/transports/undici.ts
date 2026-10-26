@@ -1,5 +1,6 @@
 import { Pool, ProxyAgent, errors } from "undici";
 import type { NetworkOptions } from "../types.js";
+import { validateNetwork } from "../validation.js";
 import type { TransportFactory } from "./transport.js";
 
 export interface UndiciTransportOptions {
@@ -13,6 +14,7 @@ export interface UndiciTransportOptions {
  * `bodyTimeout` unless the request sets them itself.
  */
 export function undiciTransport({ network }: UndiciTransportOptions = {}): TransportFactory {
+    validateNetwork(network);
     return ({ origin, connections }) => {
         const defaults = { connections, pipelining: 1, keepAliveTimeout: 10_000, headersTimeout: 30_000, bodyTimeout: 30_000 };
         const proxied = network !== undefined && "uri" in network && network.uri !== undefined;

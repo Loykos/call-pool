@@ -288,7 +288,8 @@ describe("maxElapsedTime", () => {
         try {
             await expect(pool.request("/stalled")).rejects.toBeInstanceOf(CallPoolTimeoutError);
             expect(requests).toBe(1);
-            expect(pool.getStats()).toMatchObject({ running: 0, queued: 0 });
+            // The slot frees once Undici has settled the aborted exchange
+            await expect.poll(() => pool.getStats()).toMatchObject({ running: 0, queued: 0 });
         } finally {
             await pool.close();
             await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));

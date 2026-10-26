@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { CallPool, CallPoolError, fetchTransport, undiciTransport, type TransportFactory } from "../../src/index";
+import { CallPool, CallPoolError, CallPoolTimeoutError, fetchTransport, undiciTransport, type TransportFactory } from "../../src/index";
 import { impitTransport } from "../../src/transports/impit";
 
 /** A local server with one route per behavior the contract checks. */
@@ -38,7 +38,7 @@ function startServer(): Promise<{ server: Server; baseUrl: string; active: () =>
                     res.setHeader("content-type", "text/plain");
                     return res.end(String(res.statusCode));
                 case "/slow":
-                    setTimeout(() => res.end("late"), 3_000);
+                    setTimeout(() => res.end("late"), Number(url.searchParams.get("ms") ?? 3_000));
                     return;
                 default:
                     res.statusCode = 404;
@@ -114,6 +114,30 @@ describe.each(TRANSPORTS)("transport contract: %s", (_name, transport) => {
             // The exchange itself ends, not only the promise: no request outlives its attempt
             await expect.poll(active, { timeout: 2_500 }).toBe(0);
         } finally { await single.close(); }
+    });
+
+    // impit cannot stop a request before its headers: its slot and close() must wait for the exchange
+    it.each([
+        ["the deadline", () => ({ maxElapsedTime: 30 })],
+        ["the caller's abort", () => ({ signal: AbortSignal.timeout(30) })],
+    ])("settles at %s at once, and close() waits for the exchange to end", async (_cause, options) => {
+        const single = new CallPool({ baseUrl, retry: { maxAttempts: 1 }, transport: transport() });
+        const started = performance.now();
+        await expect(single.request("/slow?ms=400", options())).rejects.toBeDefined();
+        expect(performance.now() - started).toBeLessThan(200);
+        await single.close();
+        await expect.poll(active, { timeout: 100 }).toBe(0);
+    });
+
+    it("keeps the concurrency limit across cancelled exchanges", async () => {
+        const single = new CallPool({ baseUrl, retry: { maxAttempts: 1 }, transport: transport() });
+        try {
+            for (let i = 0; i < 3; i++) {
+                await expect(single.request("/slow?ms=400", { maxElapsedTime: 30 })).rejects.toBeInstanceOf(CallPoolTimeoutError);
+                expect(active()).toBeLessThanOrEqual(1);
+            }
+        } finally { await single.close(); }
+        await expect.poll(active, { timeout: 100 }).toBe(0);
     });
 
     it("stops at the caller's abort with its reason", async () => {

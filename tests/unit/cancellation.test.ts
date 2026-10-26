@@ -288,9 +288,10 @@ describe("Cancellation", () => {
         const reason = new Error("cancel retry");
         const result = pool.request("/retry", { signal: controller.signal }).catch(error => error);
         try {
-            // Only microtasks separate the stubbed HTTP response from backoff.
+            // Only microtasks separate the stubbed HTTP response from backoff:
+            // the request's own listener, then the backoff's.
             for (let tick = 0; tick < 20; tick++) await Promise.resolve();
-            expect(getEventListeners(controller.signal, "abort")).toHaveLength(1);
+            expect(getEventListeners(controller.signal, "abort")).toHaveLength(2);
             controller.abort(reason);
             expect(await result).toBe(reason);
             expect(request).toHaveBeenCalledOnce();

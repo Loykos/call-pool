@@ -1,4 +1,4 @@
-import { Impit, type HttpMethod, type ImpitOptions, type RequestInit } from "impit";
+import { Impit, type HttpMethod, type ImpitOptions, type ImpitResponse, type RequestInit } from "impit";
 import { fetchTransport, type FetchLike, type FetchTransportOptions } from "./fetch.js";
 import type { TransportFactory } from "./transport.js";
 
@@ -22,8 +22,8 @@ const FATAL_ERRORS = new Set([
 
 /**
  * Native bound of every exchange, as Undici's 30 s header and body timeouts:
- * impit has none, and an abort only settles its promise while the native
- * request keeps running. `RequestOptions.timeout` overrides it per attempt.
+ * impit has none, and cannot stop a request before its headers.
+ * `RequestOptions.timeout` overrides it per attempt.
  */
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -52,9 +52,30 @@ export function impitTransport({ proxyUrl, rotateOn, init, timeout = DEFAULT_TIM
             async create(): Promise<FetchLike> {
                 const client = new Impit({ ...impit, timeout, proxyUrl: typeof proxyUrl === "function" ? await proxyUrl() : proxyUrl });
                 // impit types the method and the body with its own unions, and takes no null body
-                return (url, { method, body, ...rest }) => client.fetch(url, { ...(rest as RequestInit), method: method as HttpMethod, body: (body ?? undefined) as RequestInit["body"] });
+                return (url, { method, body, signal, ...rest }) => exchange(client, url, { ...(rest as RequestInit), method: method as HttpMethod, body: (body ?? undefined) as RequestInit["body"] }, signal);
             },
         },
         { init, rotateOn, isFatal: isImpitFatal },
     );
+}
+
+/**
+ * Settles when the exchange ends, so the pool holds its slot until then: an
+ * abort before the headers only settles impit's promise while the native request
+ * runs on, so impit gets the abort once the headers are in, where it stops the body.
+ */
+async function exchange(client: Impit, url: string, init: RequestInit, signal: AbortSignal): Promise<ImpitResponse> {
+    const body = new AbortController();
+    let response: ImpitResponse;
+    try {
+        response = await client.fetch(url, { ...init, signal: body.signal });
+    } catch (error) {
+        signal.throwIfAborted();
+        throw error;
+    }
+    const forward = () => body.abort(signal.reason);
+    if (signal.aborted) forward();
+    else signal.addEventListener("abort", forward, { once: true });
+    signal.throwIfAborted();
+    return response;
 }

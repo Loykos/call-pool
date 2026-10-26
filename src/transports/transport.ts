@@ -44,6 +44,10 @@ export interface RetryContext {
 
 /** How requests reach the host: the pool decides when and how many, the transport how. */
 export interface Transport {
+    /**
+     * Settles once the exchange has ended, an aborted one too: the pool settles
+     * the caller at the abort, and keeps the slot and `close()` until then.
+     */
     request(request: TransportRequest): Promise<TransportResponse>;
     /** Before every retry: a new client, proxy session or IP. Concurrent failures may call it together. */
     rotate?(context: RetryContext): void | Promise<void>;

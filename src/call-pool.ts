@@ -193,7 +193,10 @@ export class CallPool {
             // it: do not add another job behind the blocked scheduler slots.
             deadline?.assertCanWait(this.rateGate?.pausedFor() ?? 0);
             const transportOptions = deadline ? { ...reqOpts, signal } : reqOpts;
-            const envelope = await this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, transportOptions, exposeCookies, resolveStatus, deadline), signal);
+            const job = this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, transportOptions, exposeCookies, resolveStatus, deadline), signal);
+            // The caller settles at its abort; the job keeps its slot, and close(),
+            // until the transport settles: a client may not stop a request at once (impit).
+            const envelope = await untilAborted(job, signal);
             return response === "raw" ? envelope : envelope.body;
         } finally {
             deadline?.dispose();
