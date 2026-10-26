@@ -30,6 +30,18 @@ const oldPause: CallPoolOptions = { baseUrl: "http://example.com", adaptive: { r
 // @ts-expect-error Only 4xx/5xx family selectors are supported.
 const badCodes: CallPoolOptions = { baseUrl: "http://example.com", retry: { codes: ["3xx"] } };
 
+new CallPool({
+    baseUrl: "https://example.com",
+    resolveStatus: ({ status, body }) => (body === "ERRX-2" ? "blocked" : status === 404 ? 200 : undefined),
+    retry: { codes: [429, "5xx", "blocked"] },
+    circuitBreaker: { enabled: true, codes: [429, "blocked"] },
+});
+pool.request("/", { resolveStatus: () => 401 });
+// @ts-expect-error A named status starts with a lowercase letter.
+const upperName: CallPoolOptions = { baseUrl: "http://example.com", retry: { codes: ["Blocked"] } };
+// @ts-expect-error A resolver answers a number, a named status or undefined.
+const booleanResolver: CallPoolOptions = { baseUrl: "http://example.com", resolveStatus: () => true };
+
 // @ts-expect-error The draft pauseCodes option was replaced by circuitBreaker.
 const oldPauseCodes: CallPoolOptions = { baseUrl: "http://example.com", retry: { pauseCodes: [429] } };
 // @ts-expect-error Circuit breakers always wait; no onOpen switch.

@@ -1,16 +1,18 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { Pool, ProxyAgent, errors } from "undici";
-import { CallPoolOptions, CallPoolResponse, CallPoolStats, NetworkOptions, StatusCodeSelector, RateLimitSignalOptions, RequestOptions } from "./types.js";
+import { CallPoolOptions, CallPoolResponse, CallPoolStats, NetworkOptions, StatusCodeSelector, RateLimitSignalOptions, RequestOptions, ResolveStatus } from "./types.js";
 import { CallPoolError, PoolClosedError } from "./errors.js";
 import { RateGate } from "./rate-gate.js";
 import { RequestScheduler } from "./scheduler.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
-import { matchesCode, parseRetryAfter } from "./http-policy.js";
+import { isNamedStatus, matchesCode, parseRetryAfter } from "./http-policy.js";
 import { RequestDeadline } from "./request-deadline.js";
-import { validateOptions, validateMaxElapsedTime } from "./validation.js";
+import { validateOptions, validateMaxElapsedTime, validateResolveStatus } from "./validation.js";
 
 /** Per-request options left after the pool-level keys are extracted. */
-type TransportOptions = Omit<RequestOptions, "priority" | "response" | "exposeCookies" | "maxElapsedTime">;
+type TransportOptions = Omit<RequestOptions, "priority" | "response" | "exposeCookies" | "maxElapsedTime" | "resolveStatus">;
+
+type ResponseHeaders = Record<string, string | string[] | undefined>;
 
 const RATE_LIMIT_SIGNAL_DEFAULTS: Required<RateLimitSignalOptions> = { decreaseFactor: 0.5, recoveryAfter: 10 };
 
@@ -32,6 +34,7 @@ export class CallPool {
     private breaker: CircuitBreaker | undefined;
     private retryNetworkErrors: boolean;
     private defaultHeaders: Record<string, string>;
+    private resolveStatus: ResolveStatus | undefined;
 
     // Adaptive Config (Flattened for perf)
     private adaptiveEnabled: boolean;
@@ -99,6 +102,7 @@ export class CallPool {
 
         // --- 2. NETWORK & RETRY CONFIGURATION ---
         this.defaultHeaders = options.defaultHeaders ?? {};
+        this.resolveStatus = options.resolveStatus;
 
         this.maxAttempts = options.retry?.maxAttempts ?? 3;
         this.retryDelay = options.retry?.delay ?? 1000;
@@ -178,12 +182,13 @@ export class CallPool {
     public async request<T = unknown>(path: string, options: RequestOptions & { response: "raw" }): Promise<CallPoolResponse<T>>;
     public async request<T = unknown>(path: string, options?: RequestOptions): Promise<T | CallPoolResponse<T>>;
     public async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T | CallPoolResponse<T>> {
-        const { priority = 5, response = "body", exposeCookies = false, maxElapsedTime = this.maxElapsedTime, ...reqOpts } = options;
+        const { priority = 5, response = "body", exposeCookies = false, maxElapsedTime = this.maxElapsedTime, resolveStatus = this.resolveStatus, ...reqOpts } = options;
         if (!Number.isInteger(priority) || priority < 0 || priority > 9) {
             throw new Error("[CallPool] 'priority' must be an integer between 0 and 9");
         }
         if (this.closePromise) throw new PoolClosedError();
         validateMaxElapsedTime(maxElapsedTime);
+        validateResolveStatus(resolveStatus, "resolveStatus");
         const callerSignal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
         const deadline = maxElapsedTime === undefined ? undefined : new RequestDeadline(maxElapsedTime, callerSignal);
         const signal = deadline?.signal ?? callerSignal;
@@ -192,14 +197,14 @@ export class CallPool {
             // it: do not add another job behind the blocked scheduler slots.
             deadline?.assertCanWait(this.rateGate?.pausedFor() ?? 0);
             const transportOptions = deadline ? { ...reqOpts, signal } : reqOpts;
-            const envelope = await this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, transportOptions, exposeCookies, deadline), signal);
+            const envelope = await this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, transportOptions, exposeCookies, resolveStatus, deadline), signal);
             return response === "raw" ? envelope : envelope.body;
         } finally {
             deadline?.dispose();
         }
     }
 
-    private async executeWithRetry<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean, deadline?: RequestDeadline): Promise<CallPoolResponse<T>> {
+    private async executeWithRetry<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean, resolveStatus: ResolveStatus | undefined, deadline?: RequestDeadline): Promise<CallPoolResponse<T>> {
         const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
         let delay = Math.min(this.retryDelay, this.maxDelay);
 
@@ -210,7 +215,7 @@ export class CallPool {
             deadline?.assertCanWait(this.rateGate?.pausedFor() ?? 0);
 
             try {
-                const response = await this.executeOnce<T>(path, reqOpts, exposeCookies, deadline);
+                const response = await this.executeOnce<T>(path, reqOpts, exposeCookies, resolveStatus, deadline);
                 signal?.throwIfAborted();
                 deadline?.assertCanWait(0);
                 return response;
@@ -219,8 +224,9 @@ export class CallPool {
                 // reason consistently, including non-Error values and null.
                 signal?.throwIfAborted();
                 // Circuit feedback was already recorded before deciding to retry.
-                if (err instanceof CallPoolError && err.statusCode !== undefined && err.statusCode >= 400) {
-                    if (err.statusCode === 429) this.onRateLimited(err.retryAfterMs ?? delay);
+                // A resolved status stands for the real one, a resolved 429 included.
+                if (err instanceof CallPoolError && (err.resolvedStatus ?? err.statusCode) === 429) {
+                    this.onRateLimited(err.retryAfterMs ?? delay);
                 }
                 const retryable = this.isRetryableError(err);
                 if (!retryable || attempt >= this.maxAttempts) throw err;
@@ -253,7 +259,7 @@ export class CallPool {
         return this.retryNetworkErrors;
     }
 
-    private async executeOnce<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean, deadline?: RequestDeadline): Promise<CallPoolResponse<T>> {
+    private async executeOnce<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean, resolveStatus: ResolveStatus | undefined, deadline?: RequestDeadline): Promise<CallPoolResponse<T>> {
         const { body: requestBody, headers: requestHeaders, method = "GET", binary = false, ...dispatcherOptions } = reqOpts;
         // The type-level Omit doesn't stop plain-JS callers: drop the key for real.
         delete (dispatcherOptions as { throwOnError?: boolean }).throwOnError;
@@ -268,7 +274,7 @@ export class CallPool {
         const signal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
         signal?.throwIfAborted();
         const permit = this.rateGate ? await this.rateGate.acquire(signal, deadline) : undefined;
-        let observedStatus: number | undefined;
+        let observedStatus: number | string | undefined;
         let observedRetryAfter: string | string[] | undefined;
         let succeeded = false;
         try {
@@ -293,12 +299,10 @@ export class CallPool {
             const statusCode = response.statusCode;
             observedStatus = statusCode;
             observedRetryAfter = response.headers["retry-after"];
-            const adaptThisResponse = this.adaptiveEnabled && statusCode < 400;
-            if (statusCode < 400 && this.rateLimitHold > 0) this.rateLimitHold--;
-            // TTFB feedback can change scheduling while this body is still downloading.
-            if (adaptThisResponse && this.useTTFB && ttfb > 0) {
-                this.updateThrottleLogic(ttfb);
-            }
+            // Without a resolver the real status decides at once: TTFB feedback
+            // can change scheduling while this body is still downloading. With
+            // one, the feedback waits for its verdict on the read body.
+            if (!resolveStatus && statusCode < 400) this.onSuccessHeaders(ttfb);
             const resHeaders = this.sanitizeHeaders(response.headers);
             const responseType = this.getResponseBodyType(this.getHeaderValue(resHeaders["content-type"]));
             // `binary` is the caller's own answer to the question the header is
@@ -310,15 +314,19 @@ export class CallPool {
             // bodies keep their established string representation.
             const rawBody = isBinaryResponse ? Buffer.from(await response.body.arrayBuffer()) : await response.body.text();
 
+            const resolved = resolveStatus ? this.resolve(resolveStatus, statusCode, resHeaders, rawBody) : undefined;
+            const status = resolved ?? statusCode;
+            observedStatus = status;
+            const succeededHttp = typeof status === "number" && status < 400;
+            if (resolveStatus && succeededHttp) this.onSuccessHeaders(ttfb);
+
             // Full-download mode samples here; TTFB mode already sampled at headers.
-            if (adaptThisResponse && !this.useTTFB) {
+            if (this.adaptiveEnabled && !this.useTTFB && succeededHttp) {
                 const measuredDuration = performance.now() - start;
                 if (measuredDuration > 0) this.updateThrottleLogic(measuredDuration);
             }
 
-            // A Buffer rawBody implies isBinaryResponse, hence statusCode < 400:
-            // assertSuccess never reads the body there, so skip the utf8 decode.
-            this.assertSuccess(statusCode, typeof rawBody === "string" ? rawBody : "", resHeaders);
+            this.assertSuccess(statusCode, resolved, rawBody, resHeaders);
 
             // Only bodyless HTTP responses skip decoding. An empty ordinary JSON
             // response is still invalid, and an explicit byte request stays a Buffer.
@@ -326,8 +334,10 @@ export class CallPool {
 
             // Errors above always carry the sanitized copy; the opt-in only
             // uncovers Set-Cookie in the success envelope the caller asked for.
-            const result = {
+            const result: CallPoolResponse<T> = {
                 status: statusCode,
+                // assertSuccess let it through: a resolved status here is a successful number.
+                ...(typeof resolved === "number" ? { resolvedStatus: resolved } : {}),
                 headers: exposeCookies ? { ...response.headers } : resHeaders,
                 body: emptyResponse && !binary ? undefined as T : this.parseBody<T>(statusCode, rawBody, resHeaders, responseType === "json"),
             };
@@ -347,12 +357,42 @@ export class CallPool {
         return copy;
     }
 
-    private assertSuccess(statusCode: number, rawBody: string, resHeaders: Record<string, string | string[] | undefined>): void {
-        if (statusCode < 400) return;
-        const message = statusCode === 429 ? "Rate Limit Hit (429)" : `${statusCode >= 500 ? "Server" : "Client"} Error ${statusCode}: ${rawBody.substring(0, 200)}`;
+    /** Feedback of a successful response's headers: the 429 recovery hold, then the TTFB sample. */
+    private onSuccessHeaders(ttfb: number): void {
+        if (this.rateLimitHold > 0) this.rateLimitHold--;
+        if (this.adaptiveEnabled && this.useTTFB && ttfb > 0) this.updateThrottleLogic(ttfb);
+    }
+
+    /** The status the policies see; undefined when the resolver kept the real one. */
+    private resolve(resolveStatus: ResolveStatus, status: number, headers: ResponseHeaders, body: string | Buffer): number | string | undefined {
+        let resolved: unknown;
+        try {
+            resolved = resolveStatus({ status, headers, body });
+        } catch (cause) {
+            // Not a transport failure: never retried as one.
+            const error = new CallPoolError("[CallPool] 'resolveStatus' threw", { statusCode: status, headers, retryable: false });
+            error.cause = cause;
+            throw error;
+        }
+        if (resolved === undefined || resolved === status) return undefined;
+        if (isNamedStatus(resolved) || (Number.isInteger(resolved) && (resolved as number) >= 100 && (resolved as number) <= 599)) {
+            return resolved as number | string;
+        }
+        throw new CallPoolError(`[CallPool] 'resolveStatus' returned an invalid status: ${String(resolved)}`, { statusCode: status, headers, retryable: false });
+    }
+
+    private assertSuccess(statusCode: number, resolved: number | string | undefined, rawBody: string | Buffer, resHeaders: ResponseHeaders): void {
+        const status = resolved ?? statusCode;
+        if (typeof status === "number" && status < 400) return;
+        // A binary body is decoded only here, for a response resolved into a failure.
+        const body = typeof rawBody === "string" ? rawBody : rawBody.toString("utf8");
+        const real = resolved === undefined ? "" : ` (HTTP ${statusCode})`;
+        const message = typeof status === "string"
+            ? `Resolved as '${status}'${real}: ${body.substring(0, 200)}`
+            : status === 429 ? `Rate Limit Hit (429)${real}` : `${status >= 500 ? "Server" : "Client"} Error ${status}${real}: ${body.substring(0, 200)}`;
         throw new CallPoolError(message, {
-            statusCode, body: rawBody, headers: resHeaders,
-            retryable: matchesCode(statusCode, this.retryCodes),
+            statusCode, resolvedStatus: resolved, body, headers: resHeaders,
+            retryable: matchesCode(status, this.retryCodes),
             retryAfterMs: parseRetryAfter(resHeaders["retry-after"], this.maxRetryAfter),
         });
     }

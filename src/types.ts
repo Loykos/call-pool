@@ -1,7 +1,33 @@
 import type { Dispatcher, Pool, ProxyAgent } from "undici";
 
-/** HTTP failures eligible for retry or circuit breaking. */
-export type StatusCodeSelector = number | "4xx" | "5xx";
+type Letter = "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z";
+
+/**
+ * A status of your own returned by `resolveStatus`: lowercase letters, digits,
+ * `-` or `_`, starting with a letter (e.g. "blocked"). Always a failure.
+ */
+export type NamedStatus = `${Letter}${string}`;
+
+/** HTTP failures, or named statuses of your own, eligible for retry or circuit breaking. */
+export type StatusCodeSelector = number | "4xx" | "5xx" | NamedStatus;
+
+/** What `resolveStatus` sees: the response as received, body read but not parsed. */
+export interface ResolvableResponse {
+    /** HTTP status code of the response */
+    status: number;
+    /** Response headers (Set-Cookie is redacted) */
+    headers: Record<string, string | string[] | undefined>;
+    /** Text, or bytes for a binary response: never parsed, so bad JSON cannot fail the resolver */
+    body: string | Buffer;
+}
+
+/**
+ * Status the policies see in place of the real one. A number (100-599)
+ * replaces it: below 400 succeeds, from 400 fails. A {@link NamedStatus}
+ * always fails and is matched only by the `codes` that list it. `undefined`
+ * keeps the real status.
+ */
+export type ResolveStatus = (response: ResolvableResponse) => number | NamedStatus | undefined;
 
 /** Native constructor options. `uri` selects Undici ProxyAgent instead of Pool. */
 export type NetworkOptions = (Pool.Options & { uri?: never }) | ProxyAgent.Options;
@@ -96,6 +122,13 @@ export interface CallPoolOptions {
     /** Default target request headers; per-request headers override these. */
     defaultHeaders?: Record<string, string>;
 
+    /**
+     * Runs on every response, successful or not, before the pool decides its
+     * outcome: success or failure, retry, circuit breaker and rate-limit signal
+     * all see the resolved status. Overridable per request.
+     */
+    resolveStatus?: ResolveStatus;
+
     /** Reactive failure policy, independent of adaptive throttling. */
     retry?: {
         /** Total HTTP attempts including the first. Default: 3 */
@@ -175,6 +208,8 @@ export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin"
     priority?: number;
     /** Total budget from submission; overrides the pool default. Positive finite ms. */
     maxElapsedTime?: number;
+    /** Overrides the pool's `resolveStatus` for this request. */
+    resolveStatus?: ResolveStatus;
     body?: string | Buffer | Uint8Array | object | null;
     headers?: Record<string, string>;
     /**
@@ -225,6 +260,8 @@ export interface RequestOptions extends Omit<Dispatcher.RequestOptions, "origin"
 export interface CallPoolResponse<T = unknown> {
     /** HTTP status code of the final response */
     status: number;
+    /** Successful status `resolveStatus` replaced the real one with; absent when it kept it */
+    resolvedStatus?: number;
     /** Response headers (Set-Cookie is redacted unless `exposeCookies` is set) */
     headers: Record<string, string | string[] | undefined>;
     /**

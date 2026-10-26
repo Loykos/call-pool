@@ -1,5 +1,6 @@
 export interface CallPoolErrorDetails {
     statusCode?: number;
+    resolvedStatus?: number | string;
     body?: string;
     headers?: Record<string, string | string[] | undefined>;
     retryable?: boolean;
@@ -14,6 +15,8 @@ export interface CallPoolErrorDetails {
 export class CallPoolError extends Error {
     /** HTTP status code of the failing response */
     public readonly statusCode?: number;
+    /** Status `resolveStatus` replaced `statusCode` with, number or name; absent when it kept it */
+    public readonly resolvedStatus?: number | string;
     /** Raw response body */
     public readonly body?: string;
     /** Response headers (Set-Cookie is redacted) */
@@ -27,6 +30,7 @@ export class CallPoolError extends Error {
         super(message);
         this.name = "CallPoolError";
         this.statusCode = details.statusCode;
+        this.resolvedStatus = details.resolvedStatus;
         this.body = details.body;
         this.headers = details.headers;
         this.retryable = details.retryable ?? false;

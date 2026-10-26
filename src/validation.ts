@@ -1,3 +1,4 @@
+import { isNamedStatus } from "./http-policy.js";
 import { CallPoolOptions, StatusCodeSelector } from "./types.js";
 
 export function validateOptions(options: CallPoolOptions): void {
@@ -17,6 +18,7 @@ export function validateOptions(options: CallPoolOptions): void {
     }
 
     validateMaxElapsedTime(options.maxElapsedTime);
+    validateResolveStatus(options.resolveStatus, "resolveStatus");
     // Removed aliases must not silently bypass proxy/TLS/timeout configuration
     // for JavaScript consumers migrating from 0.7.
     for (const key of ["timeout", "defaultHeaders", "tls", "proxy"]) {
@@ -41,9 +43,15 @@ export function validateMaxElapsedTime(value: number | undefined): void {
 
 function validateCodes(codes: readonly StatusCodeSelector[] | undefined, field: string): void {
     if (codes === undefined) return;
-    if (!Array.isArray(codes) || codes.some(code => code !== "4xx" && code !== "5xx" &&
-        (!Number.isInteger(code) || code < 400 || code > 599))) {
-        throw new Error(`[CallPool] '${field}' must be an array of HTTP error codes (400-599), '4xx' or '5xx'`);
+    if (!Array.isArray(codes) || codes.some(code => code !== "4xx" && code !== "5xx" && !isNamedStatus(code) &&
+        (!Number.isInteger(code) || (code as number) < 400 || (code as number) > 599))) {
+        throw new Error(`[CallPool] '${field}' must be an array of HTTP error codes (400-599), '4xx', '5xx' or named statuses`);
+    }
+}
+
+export function validateResolveStatus(value: unknown, field: string): void {
+    if (value !== undefined && typeof value !== "function") {
+        throw new Error(`[CallPool] '${field}' must be a function`);
     }
 }
 
