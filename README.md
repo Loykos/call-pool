@@ -14,30 +14,20 @@ pnpm install call-pool
 
 ## Examples
 
-### Basic requests
-
-JSON responses are parsed automatically, and object request bodies are serialized to JSON.
+### Minimal example
 
 ```ts
 import { CallPool } from "call-pool";
 
-type User = { id: number; name: string };
-
 const pool = new CallPool({ baseUrl: "https://api.example.com" });
 
-const users = await pool.request<User[]>("/users");
-const created = await pool.request<User>("/users", {
-    method: "POST",
-    body: { name: "Jane" },
-    priority: 1,
-});
-
+const users = await pool.request("/users");
 await pool.close();
 ```
 
-### Rate limits and circuit breaker
+### Quota and rate limiting
 
-Spread up to 100 attempts over each minute, adapt concurrency to latency, and pause the pool after repeated failures. Each request has a 30-second total budget, including time in the queue.
+Queue 100 requests with a limit of 100 HTTP attempts per minute. `minTime: "auto"` spaces attempts at least 600 ms apart, while `concurrency.limit` caps requests in progress at five. Retries count toward the same quota.
 
 ```ts
 import { CallPool } from "call-pool";
@@ -45,83 +35,85 @@ import { CallPool } from "call-pool";
 const pool = new CallPool({
     baseUrl: "https://api.example.com",
     concurrency: { limit: 5 },
-    rateLimit: { enabled: true, minTime: "auto", quota: { max: 100, window: 60_000 } },
-    adaptive: { enabled: true, rateLimitSignal: true },
-    retry: { maxAttempts: 3 },
-    circuitBreaker: { enabled: true },
-    maxElapsedTime: 30_000,
+    rateLimit: {
+        enabled: true,
+        minTime: "auto",
+        quota: {
+            max: 100,
+            window: 60_000,
+        },
+    },
 });
 
-const results = await Promise.all(["/users", "/teams"].map(path => pool.request(path)));
+const pages = Array.from({ length: 100 }, (_, i) => i + 1);
+const results = await Promise.all(pages.map(page => pool.request(`/items?page=${page}`)));
 await pool.close();
 ```
 
-### Files, headers and cancellation
+### All defaults
+
+Only `baseUrl` is required. This shows all CallPool defaults in one place; additional native Undici options keep their own defaults. `adaptive.initialConcurrency` and transport `connections` follow `concurrency.limit` when omitted.
 
 ```ts
-import { CallPool } from "call-pool";
-
-const pool = new CallPool({ baseUrl: "https://api.example.com" });
-
-const image = await pool.request<Buffer>("/photo.jpg", { binary: true });
-const response = await pool.request<string>("/page", {
-    response: "raw",
-    signal: AbortSignal.timeout(5_000),
-});
-console.log(response.status, response.headers, response.body);
-
-await pool.close();
-```
-
-### Choosing a transport
-
-A transport controls **how an HTTP call is made**: the client, connections, proxy and TLS settings. Undici is the default; set `transport` to configure it or use another client.
-
-```ts
-import { CallPool, undiciTransport, fetchTransport } from "call-pool";
-
-const proxied = new CallPool({
-    baseUrl: "https://api.example.com",
-    transport: undiciTransport({ network: { uri: "http://proxy.example.com:3128" } }),
-});
-
-const standard = new CallPool({
-    baseUrl: "https://api.example.com",
-    transport: fetchTransport(fetch),
-});
-
-await Promise.all([proxied.close(), standard.close()]);
-```
-
-For a browser's TLS and HTTP/2 fingerprint, install `impit` separately with `pnpm add impit`:
-
-```ts
-import { CallPool } from "call-pool";
-import { impitTransport } from "call-pool/impit";
-
-const browser = new CallPool({
-    baseUrl: "https://api.example.com",
-    transport: impitTransport({ browser: "chrome", timeout: 15_000 }),
-});
-
-const page = await browser.request("/page");
-await browser.close();
-```
-
-### Custom failure statuses
-
-Use `resolveStatus` when an API reports an error inside a successful HTTP response.
-
-```ts
-import { CallPool } from "call-pool";
+import { CallPool, undiciTransport } from "call-pool";
 
 const pool = new CallPool({
-    baseUrl: "https://maps.example.com",
-    resolveStatus: ({ body }) => (body === "ERRX-2" ? "blocked" : undefined),
-    retry: { codes: [403, 408, 429, "5xx", "blocked"] },
+    baseUrl: "https://api.example.com",
+    defaultHeaders: {},
+    maxElapsedTime: undefined,
+    resolveStatus: undefined,
+
+    concurrency: {
+        limit: 1,
+    },
+    rateLimit: {
+        enabled: false,
+        minTime: 0,
+        quota: undefined,
+    },
+    adaptive: {
+        enabled: false,
+        useTTFB: true,
+        ignoreBelow: 100,
+        congestionRatio: 2,
+        breachLimit: 2,
+        increaseStep: 1,
+        decreaseFactor: 0.9,
+        minConcurrency: 1,
+        initialConcurrency: 1,
+        rateLimitSignal: false, // true uses { decreaseFactor: 0.5, recoveryAfter: 10 }
+    },
+    retry: {
+        maxAttempts: 3,
+        codes: [403, 408, 429, "5xx"],
+        networkErrors: true,
+        delay: 1000,
+        factor: 2,
+        maxDelay: 60_000,
+        maxRetryAfter: 60_000,
+    },
+    circuitBreaker: {
+        enabled: false,
+        codes: [403, 429, 503],
+        failureThreshold: 3,
+        halfOpen: {
+            after: 10_000,
+            maxRetryAfter: 60_000,
+            maxConcurrent: 1,
+            successThreshold: 2,
+        },
+    },
+    transport: undiciTransport({
+        network: {
+            connections: 1,
+            pipelining: 1,
+            keepAliveTimeout: 10_000,
+            headersTimeout: 30_000,
+            bodyTimeout: 30_000,
+        },
+    }),
 });
 
-const map = await pool.request("/map");
 await pool.close();
 ```
 
@@ -148,12 +140,12 @@ All options are optional except `baseUrl`. Durations are in milliseconds unless 
 
 ### Rate limits
 
-| Option | Type | Default | Description |
-| --- | --- | --- | --- |
-| `rateLimit.enabled` | `boolean` | `false` | Apply request spacing and quota |
-| `rateLimit.minTime` | `number \| "auto"` | `0` | Minimum spacing; `"auto"` derives it from `quota` |
-| `rateLimit.quota.max` | `number` | none | Maximum attempts per window |
-| `rateLimit.quota.window` | `number` | none | Window duration; required with `quota.max` |
+| Option                   | Type              | Default | Description                                       |
+| ------------------------ | ----------------- | ------- | ------------------------------------------------- |
+| `rateLimit.enabled`      | `boolean`         | `false` | Apply request spacing and quota                   |
+| `rateLimit.minTime`      | `number \| "auto"` | `0`     | Minimum spacing; `"auto"` derives it from `quota` |
+| `rateLimit.quota.max`    | `number`          | none    | Maximum attempts per window                       |
+| `rateLimit.quota.window` | `number`          | none    | Window duration; required with `quota.max`        |
 
 Retries count against spacing and quota just like initial attempts.
 
@@ -210,6 +202,21 @@ Retry and circuit policies are independent: `retry.codes` decides whether to ret
 
 ### Status resolution
 
+Use `resolveStatus` when an API reports an error inside a successful HTTP response.
+
+```ts
+import { CallPool } from "call-pool";
+
+const pool = new CallPool({
+    baseUrl: "https://maps.example.com",
+    resolveStatus: ({ body }) => (body === "ERRX-2" ? "blocked" : undefined),
+    retry: { codes: [403, 408, 429, "5xx", "blocked"] },
+});
+
+const map = await pool.request("/map");
+await pool.close();
+```
+
 `resolveStatus({ status, headers, body })` runs after the body is read, before JSON parsing. The body is text or a `Buffer`. Its result determines success, retries, circuit breaking and rate-limit signals.
 
 | Return value | Effect |
@@ -221,6 +228,39 @@ Retry and circuit policies are independent: `retry.codes` decides whether to ret
 Names start with a lowercase letter and contain lowercase letters, digits, `-` or `_`. The real HTTP status remains available in responses and errors alongside `resolvedStatus`. Resolver errors and invalid return values reject without retry.
 
 ### Transports
+
+A transport controls **how an HTTP call is made**: the client, connections, proxy and TLS settings. Undici is the default; set `transport` to configure it or use another client.
+
+```ts
+import { CallPool, undiciTransport, fetchTransport } from "call-pool";
+
+const proxied = new CallPool({
+    baseUrl: "https://api.example.com",
+    transport: undiciTransport({ network: { uri: "http://proxy.example.com:3128" } }),
+});
+
+const standard = new CallPool({
+    baseUrl: "https://api.example.com",
+    transport: fetchTransport(fetch),
+});
+
+await Promise.all([proxied.close(), standard.close()]);
+```
+
+For a browser's TLS and HTTP/2 fingerprint, install `impit` separately with `pnpm add impit`:
+
+```ts
+import { CallPool } from "call-pool";
+import { impitTransport } from "call-pool/impit";
+
+const browser = new CallPool({
+    baseUrl: "https://api.example.com",
+    transport: impitTransport({ browser: "chrome", timeout: 15_000 }),
+});
+
+const page = await browser.request("/page");
+await browser.close();
+```
 
 | Transport | Use it for |
 | --- | --- |
