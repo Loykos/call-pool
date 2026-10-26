@@ -36,7 +36,7 @@
         "test:coverage": "vitest --coverage",
         "test:ui": "vitest --ui",
         "test:run": "vitest run && pnpm test:types",
-        "test:types": "tsc --project tests/types/tsconfig.json",
+        "test:types": "tsc --project tests/types/tsconfig.json && tsc --project tests/types/tsconfig.dom.json",
         "typecheck": "tsc --noEmit",
         "test:e2e": "vitest run tests/e2e"
     },

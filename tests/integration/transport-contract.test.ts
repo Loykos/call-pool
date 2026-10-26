@@ -5,9 +5,12 @@ import { CallPool, CallPoolError, fetchTransport, undiciTransport, type Transpor
 import { impitTransport } from "../../src/transports/impit";
 
 /** A local server with one route per behavior the contract checks. */
-function startServer(): Promise<{ server: Server; baseUrl: string }> {
+function startServer(): Promise<{ server: Server; baseUrl: string; active: () => number }> {
     let flaky = 0;
+    let open = 0;
     const server = createServer((req, res) => {
+        open += 1;
+        res.on("close", () => { open -= 1; });
         const chunks: Buffer[] = [];
         req.on("data", chunk => chunks.push(chunk));
         req.on("end", () => {
@@ -44,7 +47,7 @@ function startServer(): Promise<{ server: Server; baseUrl: string }> {
         });
     });
     return new Promise(resolve => server.listen(0, "127.0.0.1", () => {
-        resolve({ server, baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}` });
+        resolve({ server, baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, active: () => open });
     }));
 }
 
@@ -57,10 +60,11 @@ const TRANSPORTS: Array<[string, () => TransportFactory]> = [
 describe.each(TRANSPORTS)("transport contract: %s", (_name, transport) => {
     let server: Server;
     let baseUrl: string;
+    let active: () => number;
     let pool: CallPool;
 
     beforeAll(async () => {
-        ({ server, baseUrl } = await startServer());
+        ({ server, baseUrl, active } = await startServer());
         pool = new CallPool({ baseUrl, concurrency: { limit: 2 }, retry: { delay: 0 }, transport: transport() });
     });
 
@@ -107,6 +111,8 @@ describe.each(TRANSPORTS)("transport contract: %s", (_name, transport) => {
         try {
             await expect(single.request("/slow", { timeout: 50 })).rejects.toBeDefined();
             expect(performance.now() - started).toBeLessThan(2_500);
+            // The exchange itself ends, not only the promise: no request outlives its attempt
+            await expect.poll(active, { timeout: 2_500 }).toBe(0);
         } finally { await single.close(); }
     });
 

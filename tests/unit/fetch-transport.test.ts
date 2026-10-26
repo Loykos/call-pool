@@ -1,6 +1,6 @@
 import { getEventListeners } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CallPool, fetchTransport, TransportTimeoutError, type FetchInit, type FetchLike } from "../../src/index";
+import { CallPool, CallPoolTimeoutError, fetchTransport, TransportTimeoutError, type FetchInit, type FetchLike } from "../../src/index";
 
 /** A Fetch-like client answering with `respond`, recording every call. */
 function fakeFetch(respond: (url: string, init: FetchInit) => Response | Promise<Response> = () => Response.json({ ok: true })) {
@@ -134,6 +134,32 @@ describe("fetchTransport", () => {
                 await expect(pool.request(path)).rejects.toMatchObject({ name: "CallPoolError", retryable: false, message: expect.stringContaining('path must start with "/"') });
             }
             expect(calls).toHaveLength(1);
+        } finally { await pool.close(); }
+    });
+
+    it("forwards the attempt timeout to clients with a native one", async () => {
+        const { fetch, calls } = fakeFetch();
+        const pool = new CallPool({ baseUrl: "https://api.example.com", transport: fetchTransport(fetch) });
+        try {
+            await pool.request("/", { timeout: 1_500 });
+            await pool.request("/");
+            expect(calls[0].init.timeout).toBe(1_500);
+            expect(calls[1].init).not.toHaveProperty("timeout");
+        } finally { await pool.close(); }
+    });
+
+    it("does not wait for a stalled client build past the timeout, the deadline or the caller's abort", async () => {
+        const create = () => new Promise<FetchLike>(() => {});
+        const pool = new CallPool({ baseUrl: "https://api.example.com", retry: { maxAttempts: 1 }, transport: fetchTransport({ create }) });
+        const controller = new AbortController();
+        const reason = new Error("stop");
+        try {
+            await expect(pool.request("/", { timeout: 20 })).rejects.toBeInstanceOf(TransportTimeoutError);
+            await expect(pool.request("/", { maxElapsedTime: 20 })).rejects.toBeInstanceOf(CallPoolTimeoutError);
+            const aborted = pool.request("/", { signal: controller.signal });
+            setTimeout(() => controller.abort(reason), 10);
+            await expect(aborted).rejects.toBe(reason);
+            expect(pool.getStats().running).toBe(0);
         } finally { await pool.close(); }
     });
 

@@ -9,6 +9,7 @@ import { RequestDeadline } from "./request-deadline.js";
 import { validateOptions, validateMaxElapsedTime, validateResolveStatus, validateTimeout } from "./validation.js";
 import type { Transport } from "./transports/transport.js";
 import { undiciTransport } from "./transports/undici.js";
+import { untilAborted } from "./abort.js";
 
 /** Per-request options left after the pool-level keys are extracted. */
 type TransportOptions = Omit<RequestOptions, "priority" | "response" | "exposeCookies" | "maxElapsedTime" | "resolveStatus">;
@@ -225,7 +226,8 @@ export class CallPool {
                 }
                 const retryable = this.isRetryableError(err);
                 if (!retryable || attempt >= this.maxAttempts) throw err;
-                await this.client.rotate?.({ attempt, status: err instanceof CallPoolError ? err.resolvedStatus ?? err.statusCode : undefined, error: err });
+                // A stalled rotation must not outlive the caller's signal or maxElapsedTime
+                await untilAborted(this.client.rotate?.({ attempt, status: err instanceof CallPoolError ? err.resolvedStatus ?? err.statusCode : undefined, error: err }), signal);
 
                 // An HTTP failure may carry a capped Retry-After wait, honored
                 // as-is instead of stacking the backoff delay on top of it.

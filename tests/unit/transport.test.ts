@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CallPool, undiciTransport, type CallPoolOptions, type RetryContext, type Transport, type TransportRequest, type TransportResponse } from "../../src/index";
+import { CallPool, CallPoolTimeoutError, undiciTransport, type CallPoolOptions, type RetryContext, type Transport, type TransportRequest, type TransportResponse } from "../../src/index";
 
 function response(statusCode = 200, body = '{"ok":true}'): TransportResponse {
     return {
@@ -92,6 +92,20 @@ describe("transport", () => {
         try {
             await pool.request("/");
             expect(rotations.map(({ status, error }) => [status, error === failure])).toEqual([["blocked", false], [undefined, true]]);
+        } finally { await pool.close(); }
+    });
+
+    it("does not wait for a stalled rotation past the deadline or the caller's abort", async () => {
+        const { factory } = fakeTransport([503, 503], { rotate: () => new Promise<void>(() => {}) });
+        const pool = new CallPool({ baseUrl: "https://example.com", retry: { delay: 0 }, transport: factory });
+        const controller = new AbortController();
+        const reason = new Error("stop");
+        try {
+            await expect(pool.request("/", { maxElapsedTime: 30 })).rejects.toBeInstanceOf(CallPoolTimeoutError);
+            const aborted = pool.request("/", { signal: controller.signal });
+            setTimeout(() => controller.abort(reason), 10);
+            await expect(aborted).rejects.toBe(reason);
+            expect(pool.getStats().running).toBe(0);
         } finally { await pool.close(); }
     });
 

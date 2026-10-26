@@ -1,13 +1,23 @@
+import { untilAborted } from "../abort.js";
 import type { RetryContext, Transport, TransportFactory } from "./transport.js";
 
-/** What the pool sets on every attempt; `FetchTransportOptions.init` adds a client's own extras. */
-export interface FetchInit {
+/**
+ * What the pool sets on every attempt, on top of the environment's `RequestInit`
+ * (Node's or DOM's), so the global `fetch` fits either way.
+ * `FetchTransportOptions.init` adds a client's own extras.
+ */
+export interface FetchInit extends RequestInit {
     method: string;
     headers: Record<string, string>;
-    body: string | Uint8Array | null;
     /** Caller signal, `maxElapsedTime` and `RequestOptions.timeout` together. */
     signal: AbortSignal;
     redirect: "manual" | "follow" | "error";
+    /**
+     * `RequestOptions.timeout`, for clients that also bound the exchange natively
+     * (impit): aborting their promise alone may leave the request running.
+     * Standard fetch ignores it.
+     */
+    timeout?: number;
     [option: string]: unknown;
 }
 
@@ -72,8 +82,17 @@ export function fetchTransport(source: FetchLike | FetchFactory, options: FetchT
             async request({ url, method, headers, body, signal, timeout }) {
                 const attempt = attemptSignal(signal, timeout);
                 try {
-                    const fetch = await client;
-                    const response = await fetch(url.href, { ...init, method, headers, body: body ?? null, signal: attempt.signal, redirect });
+                    // A client build may stall (e.g. waiting for a proxy): the attempt's signal still settles it
+                    const fetch = await untilAborted(client, attempt.signal);
+                    const response = await fetch(url.href, {
+                        ...init,
+                        method,
+                        headers,
+                        body: (body ?? null) as FetchInit["body"],
+                        signal: attempt.signal,
+                        redirect,
+                        ...(timeout === undefined ? {} : { timeout }),
+                    });
                     return {
                         statusCode: response.status,
                         headers: headerRecord(response.headers),

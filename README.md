@@ -377,13 +377,15 @@ const transport = fetchTransport({ create: async () => makeClient({ proxy: await
 - redirects are returned as responses, never followed (`fetchTransport` sends `redirect: "manual"`; pass `redirect: "follow"` to change it);
 - header names are lowercase and `Set-Cookie` is an array, redacted unless `exposeCookies`;
 - binary bodies keep their bytes;
-- `RequestOptions.timeout` bounds one attempt and the timed-out attempt is retried as a transport error. Undici checks it on its ~1 s timer ticks, so short timeouts fire late; Fetch clients abort on time;
-- the caller's `signal` and `maxElapsedTime` cancel the request, including the body download;
+- `RequestOptions.timeout` bounds one attempt and the timed-out attempt is retried as a transport error. Undici checks it on its ~1 s timer ticks, so short timeouts fire late; Fetch clients abort on time, and impit also receives it natively, so the exchange itself ends, not only its promise;
+- the caller's `signal` and `maxElapsedTime` cancel the request, including the body download. A client build or a rotation that stalls (e.g. waiting for a proxy) does not hold the request either: they settle it all the same;
 - client errors that a retry cannot fix (invalid arguments or URL, refused proxy credentials, misused bodies) are rejected at once.
 
 `connections` and the other socket options belong to Undici. Fetch clients and impit manage their own connections: the pool still bounds the requests in flight with `concurrency.limit`.
 
-**Your own transport.** A transport is a factory receiving the pool's `origin` and `connections`, returning an object with `request`, `close` and the optional `rotate` and `isFatal`. `request` resolves once status and headers are in, with a body read on demand:
+impit has no timeout of its own, and aborting one of its requests settles the promise while the native exchange keeps running. `impitTransport` therefore bounds every exchange at 30 s by default, like Undici's header and body timeouts; pass `timeout` to change it, or `null` to remove it.
+
+**Your own transport.** A transport is a factory receiving the pool's `origin` and `connections`, returning an object with `request`, `close` and the optional `rotate` and `isFatal`. `request` resolves once status and headers are in, with a body read on demand. `rotate` may be asynchronous: the pool waits for it, but not past the request's signal or `maxElapsedTime`. `url` is always on the pool's origin; a path that does not start with `/` is rejected:
 
 ```ts
 import type { TransportFactory } from "call-pool";
@@ -729,7 +731,7 @@ MIT
 
 ```sh
 pnpm typecheck
-pnpm test:run       # Unit, integration, local end-to-end and compile-only API tests
+pnpm test:run       # Unit, integration, local end-to-end and compile-only API tests (Node and DOM declarations)
 pnpm test:e2e       # HTTPS/CONNECT and 429 recovery end-to-end only
 ```
 

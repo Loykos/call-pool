@@ -20,6 +20,13 @@ const FATAL_ERRORS = new Set([
     "StreamClosed",
 ]);
 
+/**
+ * Native bound of every exchange, as Undici's 30 s header and body timeouts:
+ * impit has none, and an abort only settles its promise while the native
+ * request keeps running. `RequestOptions.timeout` overrides it per attempt.
+ */
+const DEFAULT_TIMEOUT_MS = 30_000;
+
 export interface ImpitTransportOptions extends Omit<ImpitOptions, "proxyUrl"> {
     /** Fixed proxy, or a factory called for the first client and again at every rotation. Undefined: direct. */
     proxyUrl?: string | (() => string | undefined | Promise<string | undefined>);
@@ -39,13 +46,13 @@ export function isImpitFatal(error: unknown): boolean {
  * fingerprint (`browser: "chrome"`, `"firefox"`, …). Redirects reach
  * the pool as responses, like with the Undici transport.
  */
-export function impitTransport({ proxyUrl, rotateOn, init, ...impit }: ImpitTransportOptions = {}): TransportFactory {
+export function impitTransport({ proxyUrl, rotateOn, init, timeout = DEFAULT_TIMEOUT_MS, ...impit }: ImpitTransportOptions = {}): TransportFactory {
     return fetchTransport(
         {
             async create(): Promise<FetchLike> {
-                const client = new Impit({ ...impit, proxyUrl: typeof proxyUrl === "function" ? await proxyUrl() : proxyUrl });
-                // impit types the method as its own union and takes no null body
-                return (url, { method, body, ...rest }) => client.fetch(url, { ...(rest as RequestInit), method: method as HttpMethod, body: body ?? undefined });
+                const client = new Impit({ ...impit, timeout, proxyUrl: typeof proxyUrl === "function" ? await proxyUrl() : proxyUrl });
+                // impit types the method and the body with its own unions, and takes no null body
+                return (url, { method, body, ...rest }) => client.fetch(url, { ...(rest as RequestInit), method: method as HttpMethod, body: (body ?? undefined) as RequestInit["body"] });
             },
         },
         { init, rotateOn, isFatal: isImpitFatal },
