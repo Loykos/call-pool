@@ -105,6 +105,7 @@ const pool = new CallPool({
     },
     maxElapsedTime: undefined,
     defaultHeaders: {},
+    resolveStatus: undefined,
     retry: {
         codes: [403, 408, 429, "5xx"],
         networkErrors: true,
@@ -202,14 +203,14 @@ await pool.close();
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `retry.maxAttempts` | `number` | `3` | Total HTTP attempts, including the first |
-| `retry.codes` | `readonly (number \| "4xx" \| "5xx")[]` | `[403, 408, 429, "5xx"]` | HTTP failures to retry; replaces defaults, `[]` disables HTTP retries |
+| `retry.codes` | `readonly (number \| "4xx" \| "5xx" \| NamedStatus)[]` | `[403, 408, 429, "5xx"]` | HTTP failures to retry; replaces defaults, `[]` disables HTTP retries |
 | `retry.networkErrors` | `boolean` | `true` | Retry transport failures independently of HTTP selectors |
 | `retry.delay` | `number` | `1000` | Initial fallback wait in ms without a valid `Retry-After` |
 | `retry.factor` | `number` | `2` | Fallback multiplier per retry |
 | `retry.maxDelay` | `number` | `60000` | Cap in ms for fallback backoff, including the initial wait |
 | `retry.maxRetryAfter` | `number` | `60000` | Cap in ms for waits from a valid `Retry-After` |
 
-Numeric selectors must be integers from 400 to 599. A valid `Retry-After` (seconds or HTTP date) replaces the fallback for that response, capped by `retry.maxRetryAfter`. Missing, empty or invalid headers use `delay`, multiplied by `factor` after each failed attempt and capped by `maxDelay`. HTTP failures and transport failures use the same total attempt budget. Cancellation and invalid local arguments are never retried.
+Numeric selectors must be integers from 400 to 599; named selectors match the statuses of your own returned by [`resolveStatus`](#status-resolution). A valid `Retry-After` (seconds or HTTP date) replaces the fallback for that response, capped by `retry.maxRetryAfter`. Missing, empty or invalid headers use `delay`, multiplied by `factor` after each failed attempt and capped by `maxDelay`. HTTP failures and transport failures use the same total attempt budget. Cancellation and invalid local arguments are never retried.
 
 Retry waits occupy the logical request's concurrency slot. With concurrency 1, a retrying request therefore also holds up the queue even without a circuit breaker. Every actual retry acquires rate-limit and circuit permission again; waiting does not consume attempts or quota.
 
@@ -293,6 +294,39 @@ A known retry delay, quota/spacing wait, or pool pause that cannot fit in the re
 `CallPoolTimeoutError` extends `CallPoolError`, has `retryable: false`, and exposes `maxElapsedTime`. When a retry is refused because its wait cannot fit, `cause` contains the original failure (including the 429 response details). The timeout itself has no HTTP status. Caller cancellation still preserves the caller's `signal.reason`. A timeout releases queued jobs or waiting permissions; an active HTTP attempt releases its slot when the transport settles after cancellation.
 
 This budget works with or without adaptive throttling. It does not shorten the server's pool pause: later work can resume after that pause. `network.headersTimeout` and `network.bodyTimeout` govern transport waits within each attempt. Without `maxElapsedTime`, there is no total deadline. Pass `request(path, { maxElapsedTime: 2000 })` to override the pool default for one request; omitting it inherits the default.
+
+### Status Resolution
+
+Some servers report failures in a successful response, or answer an error where the caller sees an answer. `resolveStatus` runs on **every** response, successful or not, once its body is read and before the pool decides the outcome. What it returns is the status every policy sees: success or failure, `retry.codes`, `circuitBreaker.codes` and the [rate-limit signal](#rate-limit-signal).
+
+| Returns | Effect |
+| --- | --- |
+| `undefined`, or the real status | Nothing changes |
+| A number from 100 to 599 | Replaces the real status: below 400 the request succeeds, from 400 it fails |
+| A `NamedStatus` (lowercase, starts with a letter, then letters, digits, `-`, `_`) | Always a failure, matched only by the `codes` that list it; never a rate-limit signal |
+
+```ts
+const wms = new CallPool({
+    baseUrl: "https://maps.example.com",
+    // The server answers 200 with this body when it blocks the caller
+    resolveStatus: ({ body }) => (body === "ERRX-2" ? "blocked" : undefined),
+    retry: { maxAttempts: 3, codes: [403, 408, 429, "5xx", "blocked"] },
+    circuitBreaker: { enabled: true, codes: [403, 429, 503, "blocked"], failureThreshold: 1, halfOpen: { after: 15_000 } },
+});
+
+// Translations: the policies act as on the returned status
+resolveStatus: ({ body }) => (body === "ERRX-2" ? 429 : undefined), // rate-limit signal included
+resolveStatus: ({ status }) => (status >= 300 && status < 400 ? 401 : undefined), // redirect to login: expired session
+resolveStatus: ({ status }) => (status === 404 ? 200 : undefined), // "not found" is an answer
+```
+
+The resolver receives `{ status, headers, body }`: the real status, the headers with `Set-Cookie` redacted, and the body as read but never parsed (text, or a `Buffer` for a binary response), so malformed JSON cannot make it fail. An error body stays text even when resolved into a success. Pass `request(path, { resolveStatus })` to override the pool resolver for one request.
+
+The real status is never lost. A failure rejects with `CallPoolError`, whose `statusCode` is the HTTP status and `resolvedStatus` the number or name that replaced it; the message names both. A success resolved from another status reports it in the raw envelope as `resolvedStatus`, next to the real `status`. `Retry-After` always comes from the real response.
+
+A resolver that throws, or returns anything else, rejects the request with a non-retryable `CallPoolError` (the thrown error as `cause`): it is never retried as a transport failure.
+
+With a resolver, adaptive feedback waits for its verdict: the TTFB sample and the rate-limit recovery count are applied once the body is read, and only when the resolved status succeeds. Without one, they still happen as soon as the headers arrive.
 
 ### Network Configuration
 
@@ -472,6 +506,7 @@ const newUser = await pool.request<User>("/users", {
 | `signal`        | `AbortSignal \| null`                              | No       | -        | Cancels queued work, quota/minTime waits, HTTP and retries        |
 | `response`      | `"body" \| "raw"`                                  | No       | `"body"` | `"raw"` resolves with a `{ status, headers, body }` envelope    |
 | `exposeCookies` | `boolean`                                          | No       | `false`  | Reveals `Set-Cookie` in the raw envelope (redacted by default)  |
+| `resolveStatus` | `ResolveStatus`                                    | No       | pool's   | Overrides the pool's [status resolution](#status-resolution)    |
 
 Header names are matched case-insensitively: request headers override `network.defaultHeaders`, so `authorization` replaces a default `Authorization`. If the same name appears with different casing within either object, the last entry wins. Each header name is sent once, and the input objects are left untouched.
 
@@ -483,7 +518,8 @@ By default `request()` resolves with the parsed body alone. With `response: "raw
 
 ```typescript
 const res = await pool.request<LoginPage>("/login", { response: "raw" });
-// res: { status: number, headers: Record<string, ...>, body: LoginPage }
+// res: { status: number, resolvedStatus?: number, headers: Record<string, ...>, body: LoginPage }
+// resolvedStatus is present only when resolveStatus replaced the real status
 
 // 3xx responses do not throw and redirects are not followed by default,
 // so raw mode lets you walk a redirect chain manually:
@@ -513,7 +549,7 @@ When enabled, the pool automatically monitors request latency and slows down whe
 -   If requests are slower than the average multiplied by `adaptive.congestionRatio` for `adaptive.breachLimit` consecutive samples, it reduces concurrency
 -   When requests become fast again, it restores concurrency gradually
 
-With `adaptive.useTTFB: true` (the default), the controller receives the latency sample as soon as non-error response headers arrive, so scheduling can adapt while the body is still downloading. With `false`, the sample is recorded after the complete body download, before parsing. Each attempt contributes at most one sample; 4xx/5xx responses are excluded. In TTFB mode, a recorded sample is retained even if the subsequent body download fails.
+With `adaptive.useTTFB: true` (the default), the controller receives the latency sample as soon as non-error response headers arrive, so scheduling can adapt while the body is still downloading. With `false`, the sample is recorded after the complete body download, before parsing. Each attempt contributes at most one sample; 4xx/5xx responses are excluded (with [`resolveStatus`](#status-resolution), the resolved status decides, once the body is read). In TTFB mode, a recorded sample is retained even if the subsequent body download fails.
 
 Requests keep their concurrency slot until they finish, including body consumption and retries. Scheduler updates retain the existing 250 ms tuning interval.
 
@@ -573,6 +609,7 @@ try {
 } catch (err) {
     if (err instanceof CallPoolError) {
         err.statusCode; // e.g. 404
+        err.resolvedStatus; // number or name from resolveStatus, when it replaced statusCode
         err.body; // raw response body
         err.headers; // response headers (Set-Cookie redacted)
         err.retryable; // whether policy permits retry, subject to attempts/budget

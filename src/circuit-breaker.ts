@@ -61,7 +61,7 @@ export class CircuitBreaker {
      * transport/parser failures and non-matching HTTP errors release permission
      * without contributing success or failure to this HTTP-code policy.
      */
-    complete(permit: CircuitPermit, status?: number, retryAfter?: string | string[], succeeded = false): void {
+    complete(permit: CircuitPermit, status?: number | string, retryAfter?: string | string[], succeeded = false): void {
         if (permit.settled) return;
         permit.settled = true;
         const failed = status !== undefined && matchesCode(status, this.codes);

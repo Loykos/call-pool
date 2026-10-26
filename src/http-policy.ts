@@ -1,6 +1,13 @@
-import type { StatusCodeSelector } from "./types.js";
+import type { NamedStatus, StatusCodeSelector } from "./types.js";
 
-export function matchesCode(code: number, selectors: readonly StatusCodeSelector[]): boolean {
+/** Lowercase, starts with a letter: never confused with a code or "4xx"/"5xx". */
+export function isNamedStatus(value: unknown): value is NamedStatus {
+    return typeof value === "string" && /^[a-z][a-z0-9_-]*$/.test(value);
+}
+
+/** A resolved status is a number or a name; a name only matches itself. */
+export function matchesCode(code: number | string, selectors: readonly StatusCodeSelector[]): boolean {
+    if (typeof code === "string") return selectors.includes(code as StatusCodeSelector);
     return selectors.some(selector => selector === code || (selector === "4xx" && code >= 400 && code < 500) || (selector === "5xx" && code >= 500 && code < 600));
 }
 
