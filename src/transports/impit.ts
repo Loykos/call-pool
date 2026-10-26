@@ -1,5 +1,5 @@
 import { Impit, type HttpMethod, type ImpitOptions, type RequestInit } from "impit";
-import { fetchTransport, type FetchLike, type FetchTransportOptions } from "./fetch-transport.js";
+import { fetchTransport, type FetchLike, type FetchTransportOptions } from "./fetch.js";
 import type { TransportFactory } from "./transport.js";
 
 /**

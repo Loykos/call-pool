@@ -2,7 +2,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { CallPool, CallPoolError, fetchTransport, undiciTransport, type TransportFactory } from "../../src/index";
-import { impitTransport } from "../../src/impit-transport";
+import { impitTransport } from "../../src/transports/impit";
 
 /** A local server with one route per behavior the contract checks. */
 function startServer(): Promise<{ server: Server; baseUrl: string }> {

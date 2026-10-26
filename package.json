@@ -12,9 +12,9 @@
             "default": "./dist/index.js"
         },
         "./impit": {
-            "types": "./dist/impit-transport.d.ts",
-            "import": "./dist/impit-transport.js",
-            "default": "./dist/impit-transport.js"
+            "types": "./dist/transports/impit.d.ts",
+            "import": "./dist/transports/impit.js",
+            "default": "./dist/transports/impit.js"
         }
     },
     "files": [

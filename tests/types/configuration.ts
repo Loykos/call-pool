@@ -1,6 +1,6 @@
 import type { Pool, ProxyAgent } from "undici";
 import { CallPool, fetchTransport, undiciTransport, type CallPoolOptions, type NetworkOptions, type RequestOptions, type TransportFactory } from "../../src/index.js";
-import { impitTransport } from "../../src/impit-transport.js";
+import { impitTransport } from "../../src/transports/impit.js";
 
 declare const direct: Pool.Options;
 declare const proxy: ProxyAgent.Options;

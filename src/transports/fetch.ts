@@ -92,8 +92,7 @@ export function fetchTransport(source: FetchLike | FetchFactory, options: FetchT
                     if (rotateOn(context)) client = build(factory);
                 }
                 : undefined,
-            // A path that is no URL fails the same way on every attempt
-            isFatal: error => (error as { code?: unknown })?.code === "ERR_INVALID_URL" || (isFatal?.(error) ?? false),
+            isFatal,
             close: async () => {
                 await close?.();
             },
