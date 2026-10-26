@@ -2,23 +2,7 @@
 
 [![license](https://img.shields.io/npm/l/call-pool)](https://github.com/Loykos/call-pool/blob/main/LICENSE)
 
-HTTP request pool with rate limiting, quotas, automatic retry, and adaptive throttling for Node.js.
-
-## Why CallPool?
-
-Managing thousands of requests against rate-limited APIs is hard. Native `fetch` or simple `undici` requests loops often lead to **429 errors**, **socket exhaustion**, or **local memory spikes**.
-
-**CallPool orchestrates your outbound traffic**, giving you precise control over concurrency, quotas, throttling and retries in a single, ready-to-use tool.
-
-The tool uses a **Real-Time Adaptive Throttling** feature (based on the **EMA algorithm**) that gives you the ability to detect upstream congestion and adjust the request rate in real-time to protect your throughput.
-
-## Features
-
--   **HTTP Connection Pool**: Uses [`undici`](https://github.com/nodejs/undici) to efficiently manage TCP connections
--   **Rate Limiting**: In-process priority scheduler with precise quota management, supporting both fixed windows and "auto" distribution
--   **Adaptive Throttling**: Real-time latency monitoring. It automatically slows down when the upstream service starts to lag, preventing 429s and timeouts
--   **Automatic Retry**: Built-in exponential backoff for network and server errors, with `Retry-After` header and `AbortSignal` support
--   **Per-Pool TLS**: Trust a private CA or present a client certificate on a single pool, without widening the trust store of the whole process
+HTTP request pool for Node.js with concurrency control, rate limits, quotas, retries and adaptive throttling. Use Undici, a Fetch-compatible client or impit to make requests while CallPool manages when they run.
 
 ## Installation
 
@@ -30,67 +14,63 @@ pnpm install call-pool
 
 ## Examples
 
-### Minimal Example
+### Minimal example
 
-Minimal configuration with only the base URL. Uses default values for all options.
+```ts
+import { CallPool } from "call-pool";
 
-```typescript
+const pool = new CallPool({ baseUrl: "https://api.example.com" });
+
+const users = await pool.request("/users");
+await pool.close();
+```
+
+### Quota and rate limiting
+
+Queue 100 requests with a limit of 100 HTTP attempts per minute. `minTime: "auto"` spaces attempts at least 600 ms apart, while `concurrency.limit` caps requests in progress at five. Retries count toward the same quota.
+
+```ts
 import { CallPool } from "call-pool";
 
 const pool = new CallPool({
     baseUrl: "https://api.example.com",
-});
-
-const data = await pool.request("/endpoint");
-await pool.close();
-```
-
-### Throttling and Quota Example
-
-For services with rate limits (e.g., external APIs with contractual quotas). The pool automatically distributes requests across the time window.
-
-```typescript
-import { CallPool } from "call-pool";
-
-const pool = new CallPool({
-    baseUrl: "https://api.external-service.com",
-    concurrency: {
-        limit: 5, // Maximum 5 concurrent requests
-    },
+    concurrency: { limit: 5 },
     rateLimit: {
         enabled: true,
-        minTime: "auto", // Automatically calculates delay from quota
+        minTime: "auto",
         quota: {
-            max: 100, // 100 requests
-            window: 60000, // in 60 seconds (1 minute)
+            max: 100,
+            window: 60_000,
         },
-    },
-    adaptive: {
-        enabled: true, // Enable adaptive throttling
-        congestionRatio: 2.5, // Slow down if latency > 2.5x the average
-    },
-    retry: {
-        maxAttempts: 5, // Total attempts for external services
-        delay: 2000, // 2 seconds initial wait
-        factor: 2, // Exponential backoff between attempts: 2s, 4s, 8s, 16s
     },
 });
 
-const result = await pool.request("/api/data");
+const pages = Array.from({ length: 100 }, (_, i) => i + 1);
+const results = await Promise.all(pages.map(page => pool.request(`/items?page=${page}`)));
 await pool.close();
 ```
 
 ### All defaults
 
-`baseUrl` is required and has no default. Below are all CallPool defaults; additional `network` options retain Undici's defaults. `initialConcurrency` and `network.connections` follow the configured `concurrency.limit` unless explicitly overridden.
+Only `baseUrl` is required. This shows all CallPool defaults in one place; additional native Undici options keep their own defaults. `adaptive.initialConcurrency` and transport `connections` follow `concurrency.limit` when omitted.
 
-```typescript
-import { CallPool } from "call-pool";
+```ts
+import { CallPool, undiciTransport } from "call-pool";
 
 const pool = new CallPool({
-    baseUrl: "https://api.example.com", // Required caller-supplied value
-    concurrency: { limit: 1 },
-    rateLimit: { enabled: false, minTime: 0, quota: undefined },
+    baseUrl: "https://api.example.com",
+    defaultHeaders: {},
+    maxElapsedTime: undefined,
+    resolveStatus: undefined,
+
+    concurrency: {
+        limit: 1,
+    },
+    rateLimit: {
+        enabled: false,
+        minTime: 0,
+        quota: undefined,
+    },
     adaptive: {
         enabled: false,
         useTTFB: true,
@@ -101,15 +81,12 @@ const pool = new CallPool({
         decreaseFactor: 0.9,
         minConcurrency: 1,
         initialConcurrency: 1,
-        rateLimitSignal: false,
+        rateLimitSignal: false, // true uses { decreaseFactor: 0.5, recoveryAfter: 10 }
     },
-    maxElapsedTime: undefined,
-    defaultHeaders: {},
-    resolveStatus: undefined,
     retry: {
+        maxAttempts: 3,
         codes: [403, 408, 429, "5xx"],
         networkErrors: true,
-        maxAttempts: 3,
         delay: 1000,
         factor: 2,
         maxDelay: 60_000,
@@ -126,529 +103,293 @@ const pool = new CallPool({
             successThreshold: 2,
         },
     },
-    network: {
-        connections: 1,
-        pipelining: 1,
-        keepAliveTimeout: 10_000,
-        headersTimeout: 30_000,
-        bodyTimeout: 30_000,
-    },
-});
-
-// Usage examples
-// JSON parsing is automatic for application/json and media types ending in +json
-const users = await pool.request<User[]>("/users");
-
-const newUser = await pool.request<User>("/users", {
-    method: "POST",
-    body: { name: "John", email: "john@example.com" }, // Automatically serialized to JSON
-    priority: 1, // High priority
-});
-
-const urgent = await pool.request("/urgent", {
-    method: "GET",
-    priority: 1,
-    headers: {
-        "X-Custom-Header": "value",
-    },
+    transport: undiciTransport({
+        network: {
+            connections: 1,
+            pipelining: 1,
+            keepAliveTimeout: 10_000,
+            headersTimeout: 30_000,
+            bodyTimeout: 30_000,
+        },
+    }),
 });
 
 await pool.close();
 ```
 
-## Configuration
+## Full configuration
 
-### Base Configuration
+All options are optional except `baseUrl`. Durations are in milliseconds unless noted otherwise.
 
-| Option    | Type     | Required | Default | Description               |
-| --------- | -------- | -------- | ------- | ------------------------- |
-| `baseUrl` | `string` | Yes      | -       | Base URL for all requests |
-| `defaultHeaders` | `Record<string, string>` | No | `{}` | Target request headers; per-request headers override them case-insensitively |
-| `maxElapsedTime` | `number` | No | unlimited | Positive finite total request budget in ms, including queue; overridable per request |
+### Pool options
 
-### Concurrency Configuration
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `baseUrl` | `string` | required | Base URL for all requests |
+| `defaultHeaders` | `Record<string, string>` | `{}` | Request headers; per-request headers override them case-insensitively |
+| `maxElapsedTime` | `number` | unlimited | Positive finite total request budget, including queue, attempts and retries |
+| `resolveStatus` | `ResolveStatus` | none | Override response classification; see [Status resolution](#status-resolution) |
+| `transport` | `TransportFactory` | `undiciTransport()` | HTTP client; see [Transports](#transports) |
+| `network` | `NetworkOptions` | none | Deprecated shorthand for `undiciTransport({ network })`; cannot be combined with `transport` |
 
-| Option              | Type     | Required | Default | Description                           |
-| ------------------- | -------- | -------- | ------- | ------------------------------------- |
-| `concurrency.limit` | `number` | No       | `1`     | Maximum number of concurrent requests |
+### Concurrency
 
-### Rate Limit Configuration
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `concurrency.limit` | `number` | `1` | Maximum concurrent requests, including body reads and retry waits |
 
-| Option                               | Type               | Required | Default | Description                                                                                                                                      |
-| ------------------------------------ | ------------------ | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `rateLimit.enabled` | `boolean` | No | `false` | Enables spacing and quota; otherwise neither is applied |
-| `rateLimit.minTime`                  | `number \| "auto"` | No       | `0`     | Minimum time between requests in ms, or `"auto"` for automatic calculation (requires `quota`)                                                    |
-| `rateLimit.quota.max`                | `number`           | No       | -       | Maximum number of requests allowed in the time window                                                                                            |
-| `rateLimit.quota.window`             | `number`           | No       | -       | Time window in ms (e.g., 60000 for 1 minute)                                                                                                     |
+### Rate limits
 
-### Adaptive Configuration
+| Option                   | Type              | Default | Description                                       |
+| ------------------------ | ----------------- | ------- | ------------------------------------------------- |
+| `rateLimit.enabled`      | `boolean`         | `false` | Apply request spacing and quota                   |
+| `rateLimit.minTime`      | `number \| "auto"` | `0`     | Minimum spacing; `"auto"` derives it from `quota` |
+| `rateLimit.quota.max`    | `number`          | none    | Maximum attempts per window                       |
+| `rateLimit.quota.window` | `number`          | none    | Window duration; required with `quota.max`        |
 
-| Option                    | Type      | Required | Default | Description                                                                                                      |
-| ------------------------- | --------- | -------- | ------- | ---------------------------------------------------------------------------------------------------------------- |
-| `adaptive.enabled`        | `boolean` | No       | `false` | Enable adaptive throttling based on latency monitoring                                                           |
-| `adaptive.useTTFB`        | `boolean` | No       | `true`  | Measure Time To First Byte instead of full body download                                                          |
-| `adaptive.ignoreBelow`    | `number`  | No       | `100`   | Requests faster than this threshold are treated as headroom signals and excluded from the baseline                |
-| `adaptive.congestionRatio` | `number`  | No       | `2.0`   | If latency > average × ratio, the request counts as congestion                                                    |
-| `adaptive.breachLimit`    | `number`  | No       | `2`     | Consecutive congestion samples required before reducing concurrency                                               |
-| `adaptive.increaseStep`   | `number`  | No       | `1`     | Number of concurrency slots added during recovery                                                                 |
-| `adaptive.decreaseFactor` | `number`  | No       | `0.9`   | Multiplicative decrease factor applied during congestion. Must be greater than 0 and less than 1                  |
-| `adaptive.minConcurrency` | `number`  | No       | `1`     | Lower bound for adaptive concurrency. Cannot exceed `concurrency.limit`                                           |
-| `adaptive.initialConcurrency` | `number` | No    | `concurrency.limit` | Starting concurrency for the adaptive algorithm (slow-start). Must be between `minConcurrency` and `concurrency.limit` |
-| `adaptive.rateLimitSignal` | `boolean \| object` | No | `false` | Treats a 429 as a pool-wide signal (see [Rate-limit signal](#rate-limit-signal)). `true` uses the defaults below |
-| `adaptive.rateLimitSignal.decreaseFactor` | `number` | No | `0.5` | Multiplicative concurrency cut applied once per rate-limit episode. Must be greater than 0 and less than 1 |
-| `adaptive.rateLimitSignal.recoveryAfter` | `number` | No | `10` | Successful responses required after the last 429 before concurrency may grow again |
+Retries count against spacing and quota just like initial attempts.
 
-### Retry Configuration
+### Adaptive throttling
+
+When enabled, CallPool reduces concurrency as successful responses get slower and gradually restores it as latency recovers, up to `concurrency.limit`.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `adaptive.enabled` | `boolean` | `false` | Adjust concurrency based on latency |
+| `adaptive.useTTFB` | `boolean` | `true` | Measure time to response headers instead of the complete body |
+| `adaptive.ignoreBelow` | `number` | `100` | Faster responses signal spare capacity and are excluded from the latency baseline |
+| `adaptive.congestionRatio` | `number` | `2` | Latency above the moving average × this ratio signals congestion |
+| `adaptive.breachLimit` | `number` | `2` | Consecutive congestion samples before reducing concurrency |
+| `adaptive.increaseStep` | `number` | `1` | Concurrency slots added during recovery |
+| `adaptive.decreaseFactor` | `number` | `0.9` | Concurrency multiplier on congestion; between 0 and 1, exclusive |
+| `adaptive.minConcurrency` | `number` | `1` | Minimum concurrency; cannot exceed `concurrency.limit` |
+| `adaptive.initialConcurrency` | `number` | `concurrency.limit` | Starting concurrency, between the minimum and limit |
+| `adaptive.rateLimitSignal` | `boolean \| object` | `false` | Reduce concurrency on 429; `true` uses the defaults below |
+| `adaptive.rateLimitSignal.decreaseFactor` | `number` | `0.5` | Concurrency multiplier, applied once per rate-limit episode; between 0 and 1, exclusive |
+| `adaptive.rateLimitSignal.recoveryAfter` | `number` | `10` | Successful responses after the last 429 before concurrency can grow again |
+
+The rate-limit signal requires `adaptive.enabled`. To pause the whole pool, enable the [circuit breaker](#circuit-breaker) as well.
+
+### Retries
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `retry.maxAttempts` | `number` | `3` | Total HTTP attempts, including the first |
-| `retry.codes` | `readonly (number \| "4xx" \| "5xx" \| NamedStatus)[]` | `[403, 408, 429, "5xx"]` | HTTP failures to retry; replaces defaults, `[]` disables HTTP retries |
-| `retry.networkErrors` | `boolean` | `true` | Retry transport failures independently of HTTP selectors |
-| `retry.delay` | `number` | `1000` | Initial fallback wait in ms without a valid `Retry-After` |
-| `retry.factor` | `number` | `2` | Fallback multiplier per retry |
-| `retry.maxDelay` | `number` | `60000` | Cap in ms for fallback backoff, including the initial wait |
-| `retry.maxRetryAfter` | `number` | `60000` | Cap in ms for waits from a valid `Retry-After` |
+| `retry.codes` | `readonly StatusCodeSelector[]` | `[403, 408, 429, "5xx"]` | Failures to retry; replaces defaults, `[]` disables HTTP retries |
+| `retry.networkErrors` | `boolean` | `true` | Retry transport failures independently of HTTP codes |
+| `retry.delay` | `number` | `1000` | Initial wait without a valid `Retry-After` |
+| `retry.factor` | `number` | `2` | Backoff multiplier per retry |
+| `retry.maxDelay` | `number` | `60000` | Maximum backoff wait |
+| `retry.maxRetryAfter` | `number` | `60000` | Maximum wait from a valid `Retry-After` |
 
-Numeric selectors must be integers from 400 to 599; named selectors match the statuses of your own returned by [`resolveStatus`](#status-resolution). A valid `Retry-After` (seconds or HTTP date) replaces the fallback for that response, capped by `retry.maxRetryAfter`. Missing, empty or invalid headers use `delay`, multiplied by `factor` after each failed attempt and capped by `maxDelay`. HTTP failures and transport failures use the same total attempt budget. Cancellation and invalid local arguments are never retried.
+Codes accept HTTP errors from 400 to 599, `"4xx"`, `"5xx"`, or a named status from [status resolution](#status-resolution). A valid `Retry-After` (seconds or HTTP date) replaces exponential backoff for that response. Cancellation and invalid local arguments are never retried.
 
-Retry waits occupy the logical request's concurrency slot. With concurrency 1, a retrying request therefore also holds up the queue even without a circuit breaker. Every actual retry acquires rate-limit and circuit permission again; waiting does not consume attempts or quota.
+### Circuit breaker
 
-### Circuit Breaker Configuration
+The circuit breaker pauses new attempts across the pool after repeated matching failures. Requests stay queued while it is open. After the wait, a limited number of requests test recovery; successful probes restore normal traffic, while a matching failure opens it again.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `circuitBreaker.enabled` | `boolean` | `false` | Explicitly enable the shared circuit |
-| `circuitBreaker.codes` | same selectors as `retry.codes` | `[403, 429, 503]` | HTTP failures that contribute to opening the circuit |
-| `circuitBreaker.failureThreshold` | `number` | `3` | Consecutive matching failures across all HTTP attempts in the pool |
-| `circuitBreaker.halfOpen.after` | `number` | `10000` | Fixed wait in ms before probes when Retry-After is missing/invalid |
-| `circuitBreaker.halfOpen.maxRetryAfter` | `number` | `60000` | Independent cap for the server's requested circuit wait |
-| `circuitBreaker.halfOpen.maxConcurrent` | `number` | `1` | Maximum simultaneous probe attempts, also subject to pool concurrency |
-| `circuitBreaker.halfOpen.successThreshold` | `number` | `2` | Completed successful probes needed to restore normal traffic |
+| `circuitBreaker.enabled` | `boolean` | `false` | Enable the shared circuit |
+| `circuitBreaker.codes` | `readonly StatusCodeSelector[]` | `[403, 429, 503]` | HTTP or named failures that count toward opening the circuit |
+| `circuitBreaker.failureThreshold` | `number` | `3` | Consecutive matching failures across attempts in the pool |
+| `circuitBreaker.halfOpen.after` | `number` | `10000` | Wait before recovery probes without a valid `Retry-After` |
+| `circuitBreaker.halfOpen.maxRetryAfter` | `number` | `60000` | Maximum circuit wait from `Retry-After` |
+| `circuitBreaker.halfOpen.maxConcurrent` | `number` | `1` | Maximum simultaneous recovery probes |
+| `circuitBreaker.halfOpen.successThreshold` | `number` | `2` | Successful probes required to resume normal traffic |
 
-- **Closed:** attempts proceed normally. Matching failures, including retries and final failed attempts, increment a pool-wide counter. A completed successful response resets it. Non-matching HTTP errors and failures without a matching HTTP response do not increment or reset the counter. A matching HTTP refusal remains a failure even if reading its error body subsequently fails.
-- **Open:** new attempts wait, including pending retries. The queue is retained; there is no `onOpen` switch or automatic fail-fast error. Requests already admitted can finish. A matching late failure from the same closed generation can extend this open period, never shorten it.
-- **Half-open:** after the open wait expires, pending application requests are admitted as probes, up to `maxConcurrent`. No background health-check requests are generated. Successful probes count only after their bodies are fully consumed and parsed. Once `successThreshold` is reached, outstanding probes are drained before the circuit closes. Any matching failed probe reopens it immediately and resets recovery progress. Older generations cannot close or reopen a later probe cycle.
+Retry and circuit policies are independent: `retry.codes` decides whether to retry a request, while `circuitBreaker.codes` decides whether failures pause the pool. Network errors do not open the circuit. Set `maxElapsedTime` or pass an `AbortSignal` to bound waiting when a server keeps refusing requests.
 
-A non-matching HTTP error, transport/parser failure, or cancellation during a probe releases its permission without counting as recovery. Other pending requests can then probe; network errors remain governed by `retry.networkErrors`. The breaker classifies **HTTP codes**, not transport failures. If no work is pending, it sends nothing and creates no periodic timer.
+### Status resolution
 
-The failure that opens/reopens the circuit supplies its `Retry-After`: a valid header replaces `halfOpen.after`, capped by `halfOpen.maxRetryAfter`. There is no implicit exponential escalation in the circuit; each unsuccessful probe cycle starts another fixed/header-directed wait. `halfOpen.after` is the delay before a probe cycle, not the interval between successful probes. Subsequent probes can start immediately, subject to rate limits.
-
-The retry and breaker lists are independent and may overlap:
-
-| Response matches | Refused request | Shared circuit |
-| --- | --- | --- |
-| `retry.codes` only | Retries while attempts remain | No failure contribution |
-| `circuitBreaker.codes` only | Rejects after the response | Contributes to the opening threshold |
-| Both | Retains its retry if attempts remain | Contributes to the opening threshold; retry waits for permission |
-| Neither | Rejects | No failure contribution |
-
-Retry and circuit waits overlap, never add up: each attempt waits until both policies allow it, then respects concurrency, spacing and quota. Their `maxRetryAfter` values are independent. Neither entering half-open nor closing the circuit resets a request's `maxAttempts` or `maxElapsedTime` budget.
-
-The circuit works with `rateLimit.enabled: false` and `adaptive.enabled: false`. Without a total budget or cancellation, requests may remain queued while a portal keeps refusing. Configure `maxElapsedTime` to bound that waiting.
+Use `resolveStatus` when an API reports an error inside a successful HTTP response.
 
 ```ts
-const pool = new CallPool({
-    baseUrl: "https://portal.example.com",
-    retry: { codes: [403, 408, 429, "5xx"], maxAttempts: 3 },
-    circuitBreaker: {
-        enabled: true,
-        codes: [403, 429, 503],
-        failureThreshold: 3,
-        halfOpen: { after: 10_000, maxRetryAfter: 60_000, maxConcurrent: 1, successThreshold: 2 },
-    },
-});
-```
-
-#### Bounding requests against a persistently rate-limited server
-
-`retry.maxDelay`, `retry.maxRetryAfter` and `circuitBreaker.halfOpen.maxRetryAfter` cap individual waits; repeated pauses can still keep a request and the queue behind it waiting for minutes. Set `maxElapsedTime` to bound the whole logical request, starting when it is submitted to the pool:
-
-```ts
-import { CallPool, CallPoolTimeoutError } from "call-pool";
+import { CallPool } from "call-pool";
 
 const pool = new CallPool({
-    baseUrl: "https://api.example.com",
-    maxElapsedTime: 10_000,
-    retry: { maxAttempts: 3 },
-    circuitBreaker: { enabled: true },
-});
-
-try {
-    const result = await pool.request("/resource");
-} catch (error) {
-    if (error instanceof CallPoolTimeoutError) {
-        // Skip this resource: its remaining budget cannot accommodate the wait,
-        // or its total deadline expired. The pool will not retry this error.
-        console.warn("Request budget exhausted", error.maxElapsedTime);
-    } else {
-        throw error;
-    }
-} finally {
-    await pool.close();
-}
-```
-
-A known retry delay, quota/spacing wait, or pool pause that cannot fit in the remaining budget rejects immediately. New requests also fail before entering the scheduler when the current pool pause already exceeds their budget. Queued requests keep their original deadline; each retry uses the same budget. If a later 429 extends the pause, requests already waiting at the rate gate are checked again. Other waits, including active HTTP and body reads, are cancelled when the deadline expires.
-
-`CallPoolTimeoutError` extends `CallPoolError`, has `retryable: false`, and exposes `maxElapsedTime`. When a retry is refused because its wait cannot fit, `cause` contains the original failure (including the 429 response details). The timeout itself has no HTTP status. Caller cancellation still preserves the caller's `signal.reason`. A timeout releases queued jobs or waiting permissions; an active HTTP attempt releases its slot when the transport settles after cancellation.
-
-This budget works with or without adaptive throttling. It does not shorten the server's pool pause: later work can resume after that pause. `network.headersTimeout` and `network.bodyTimeout` govern transport waits within each attempt. Without `maxElapsedTime`, there is no total deadline. Pass `request(path, { maxElapsedTime: 2000 })` to override the pool default for one request; omitting it inherits the default.
-
-### Status Resolution
-
-Some servers report failures in a successful response, or answer an error where the caller sees an answer. `resolveStatus` runs on **every** response, successful or not, once its body is read and before the pool decides the outcome. What it returns is the status every policy sees: success or failure, `retry.codes`, `circuitBreaker.codes` and the [rate-limit signal](#rate-limit-signal).
-
-| Returns | Effect |
-| --- | --- |
-| `undefined`, or the real status | Nothing changes |
-| A number from 100 to 599 | Replaces the real status: below 400 the request succeeds, from 400 it fails |
-| A `NamedStatus` (lowercase, starts with a letter, then letters, digits, `-`, `_`) | Always a failure, matched only by the `codes` that list it; never a rate-limit signal |
-
-```ts
-const wms = new CallPool({
     baseUrl: "https://maps.example.com",
-    // The server answers 200 with this body when it blocks the caller
     resolveStatus: ({ body }) => (body === "ERRX-2" ? "blocked" : undefined),
-    retry: { maxAttempts: 3, codes: [403, 408, 429, "5xx", "blocked"] },
-    circuitBreaker: { enabled: true, codes: [403, 429, 503, "blocked"], failureThreshold: 1, halfOpen: { after: 15_000 } },
+    retry: { codes: [403, 408, 429, "5xx", "blocked"] },
 });
 
-// Translations: the policies act as on the returned status
-resolveStatus: ({ body }) => (body === "ERRX-2" ? 429 : undefined), // rate-limit signal included
-resolveStatus: ({ status }) => (status >= 300 && status < 400 ? 401 : undefined), // redirect to login: expired session
-resolveStatus: ({ status }) => (status === 404 ? 200 : undefined), // "not found" is an answer
+const map = await pool.request("/map");
+await pool.close();
 ```
 
-The resolver receives `{ status, headers, body }`: the real status, the headers with `Set-Cookie` redacted, and the body as read but never parsed (text, or a `Buffer` for a binary response), so malformed JSON cannot make it fail. An error body stays text even when resolved into a success. Pass `request(path, { resolveStatus })` to override the pool resolver for one request.
+`resolveStatus({ status, headers, body })` runs after the body is read, before JSON parsing. The body is text or a `Buffer`. Its result determines success, retries, circuit breaking and rate-limit signals.
 
-The real status is never lost. A failure rejects with `CallPoolError`, whose `statusCode` is the HTTP status and `resolvedStatus` the number or name that replaced it; the message names both. A success resolved from another status reports it in the raw envelope as `resolvedStatus`, next to the real `status`. `Retry-After` always comes from the real response.
+| Return value | Effect |
+| --- | --- |
+| `undefined` | Keep the HTTP status |
+| Number from 100 to 599 | Use this status; below 400 succeeds |
+| Named status, such as `"blocked"` | Fail; only matching named entries in `codes` apply |
 
-A resolver that throws, or returns anything else, rejects the request with a non-retryable `CallPoolError` (the thrown error as `cause`): it is never retried as a transport failure.
+Names start with a lowercase letter and contain lowercase letters, digits, `-` or `_`. The real HTTP status remains available in responses and errors alongside `resolvedStatus`. Resolver errors and invalid return values reject without retry.
 
-With a resolver, adaptive feedback waits for its verdict: the TTFB sample and the rate-limit recovery count are applied once the body is read, and only when the resolved status succeeds. Without one, they still happen as soon as the headers arrive.
+### Transports
 
-### Network Configuration
-
-`network` accepts native Undici `Pool.Options` for direct connections, or `ProxyAgent.Options` when `uri` is present. Values are forwarded to the selected constructor without renaming or filtering; native validation and semantics apply. Some transport validation happens on the first request.
-
-CallPool supplies these defaults, which explicit network options override:
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `connections` | `concurrency.limit` | Maximum transport connections; independent of logical scheduler concurrency |
-| `pipelining` | `1` | Native HTTP pipelining setting; `0` disables keep-alive |
-| `keepAliveTimeout` | `10000` | Undici keep-alive timeout in ms |
-| `headersTimeout` | `30000` | Undici response-header timeout in ms |
-| `bodyTimeout` | `30000` | Undici body inactivity timeout in ms |
-
-For options supported at both levels, request overrides take precedence over `network`, then CallPool defaults. `0` retains Undici's meaning for timeouts. Other constructor options, including connector functions, factories, interceptors and TLS settings, keep their native contract. Request-only options such as `reset` belong in `request()`.
-
-#### Proxy and connection reuse
+A transport controls **how an HTTP call is made**: the client, connections, proxy and TLS settings. Undici is the default; set `transport` to configure it or use another client.
 
 ```ts
-const pool = new CallPool({
-    baseUrl: "https://api.example.com",
-    network: {
-        uri: "http://user:pass@proxy.example.com:3128",
-        pipelining: 0, // New connection/tunnel for each HTTP attempt
-        // token: "Basic ...", // Alternative native proxy authentication
-    },
-});
-```
-
-With Undici's default proxy tunnelling, HTTPS remains encrypted end to end with the target. The pool sees the target's responses and applies the same retry/pause policy. Native `network.headers` are **proxy headers**; use top-level `defaultHeaders` for the target.
-
-Keep-alive normally reuses a CONNECT tunnel across requests. A rotating proxy that chooses an exit per tunnel will therefore keep that exit while the tunnel is reused, even without a sticky-session identifier. `pipelining: 0` creates fresh connections; alternatively `request(path, { reset: true })` closes the connection after that response. Use reset consistently if every request must close its connection. A fresh tunnel does not guarantee a different public IP: that depends on the proxy provider, eligible exits and session/lease policy. Sticky sessions remain the proxy's responsibility.
-
-#### TLS
-
-Use `network.connect` for direct TLS, `network.requestTls` for the target through a proxy, and `network.proxyTls` for an HTTPS proxy hop. Certificates and keys are PEM content, loaded by the caller. Native Undici/Node validation applies; CallPool no longer validates PEM strings itself. Trust remains scoped to each pool.
-
-```ts
-import { readFileSync } from "node:fs";
-
-const direct = new CallPool({
-    baseUrl: "https://api.internal.example.com",
-    network: { connect: { ca: readFileSync("./certs/internal-ca.pem") } },
-});
+import { CallPool, undiciTransport, fetchTransport } from "call-pool";
 
 const proxied = new CallPool({
-    baseUrl: "https://api.partner.example.com",
-    network: {
-        uri: "https://proxy.example.com:3128",
-        proxyTls: { ca: readFileSync("./certs/proxy-ca.pem") },
-        requestTls: {
-            ca: readFileSync("./certs/partner-ca.pem"),
-            cert: readFileSync("./certs/client.crt"),
-            key: readFileSync("./certs/client.key"),
-        },
-    },
+    baseUrl: "https://api.example.com",
+    transport: undiciTransport({ network: { uri: "http://proxy.example.com:3128" } }),
 });
+
+const standard = new CallPool({
+    baseUrl: "https://api.example.com",
+    transport: fetchTransport(fetch),
+});
+
+await Promise.all([proxied.close(), standard.close()]);
 ```
 
-### Migrating from 0.7.x to 0.8.0
+For a browser's TLS and HTTP/2 fingerprint, install `impit` separately with `pnpm add impit`:
 
-| Previous configuration | 0.8.0 |
+```ts
+import { CallPool } from "call-pool";
+import { impitTransport } from "call-pool/impit";
+
+const browser = new CallPool({
+    baseUrl: "https://api.example.com",
+    transport: impitTransport({ browser: "chrome", timeout: 15_000 }),
+});
+
+const page = await browser.request("/page");
+await browser.close();
+```
+
+| Transport | Use it for |
 | --- | --- |
-| `network.proxy` | `network.uri` (native `ProxyAgent`) |
+| `undiciTransport({ network })` | Connection pooling, proxies and TLS; used by default |
+| `fetchTransport(fetch)` | Any Fetch-compatible client, including Node's global `fetch` |
+| `impitTransport(options)` | Browser TLS and HTTP/2 fingerprints; import from `call-pool/impit` |
+
+With impit, `proxyUrl` can be a string or a function such as `() => proxies.next()`. A function is called for the initial client and again before retries.
+
+**Limits**
+
+- Redirects are not followed by default. Undici-specific options apply only to `undiciTransport`.
+- Fetch-based TTFB measurements require a client that resolves when headers arrive, before downloading the body.
+- Undici checks timeouts roughly once per second, so very short timeouts can fire late.
+- With impit, cancellation rejects immediately, but the request can keep its concurrency slot and delay `close()` until the body finishes or the native read fails. Its native timeout defaults to 30 seconds.
+- In impit 0.14.7, a timeout while reading the body can leave the connection open. CallPool cannot guarantee connection closure in that case.
+
+#### Undici network options
+
+Pass native Undici `Pool.Options` to `undiciTransport({ network })`, or `ProxyAgent.Options` when `uri` is set. CallPool supplies these defaults:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `connections` | `concurrency.limit` | Maximum transport connections |
+| `pipelining` | `1` | HTTP pipelining; `0` disables keep-alive |
+| `keepAliveTimeout` | `10000` | Keep-alive timeout |
+| `headersTimeout` | `30000` | Response-header timeout |
+| `bodyTimeout` | `30000` | Body inactivity timeout |
+
+Other common native options:
+
+| Option | Use |
+| --- | --- |
+| `uri` | Proxy URL |
+| `token` | Proxy authorization |
+| `headers` | Proxy headers; use `defaultHeaders` for target request headers |
+| `connect` | Direct TLS options, such as `ca`, `cert` and `key` |
+| `requestTls` | Target TLS options through a proxy |
+| `proxyTls` | TLS options for an HTTPS proxy |
+
+Certificates and keys are PEM content, for example `ca: readFileSync("./certs/ca.pem")`. Trust stays scoped to the pool. Per-request timeout options override network defaults; `0` keeps Undici's meaning of no timeout.
+
+Keep-alive reuses connections and proxy tunnels. Use `pipelining: 0` for a fresh connection on each attempt, or `request(path, { reset: true })` to close it after that response. A fresh tunnel does not guarantee a different exit IP; that depends on the proxy provider.
+
+### Request options
+
+Pass these as the second argument to `pool.request<T>(path, options)`.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `method` | `HttpMethod` | `"GET"` | HTTP method |
+| `priority` | `number` | `5` | Queue priority from 0 to 9; lower runs first |
+| `body` | `string \| Buffer \| Uint8Array \| object \| null` | none | Objects are serialized to JSON |
+| `headers` | `Record<string, string>` | none | Override pool headers case-insensitively |
+| `signal` | `AbortSignal \| null` | none | Cancel the request, including queue and retry waits |
+| `timeout` | `number` | transport's | Attempt timeout; see below |
+| `maxElapsedTime` | `number` | pool's | Override the total request budget, including queue and retries |
+| `response` | `"body" \| "raw"` | `"body"` | Return the parsed body or `{ status, headers, body, resolvedStatus? }` |
+| `binary` | `boolean` | `false` | Return a `Buffer` regardless of `Content-Type` |
+| `exposeCookies` | `boolean` | `false` | Include real `Set-Cookie` values in raw responses |
+| `resolveStatus` | `ResolveStatus` | pool's | Override [status resolution](#status-resolution) |
+
+`timeout` covers the complete exchange for Fetch clients. For Undici it sets both header and body inactivity timeouts; explicit `headersTimeout` or `bodyTimeout` take precedence. A timed-out attempt may be retried. `maxElapsedTime` limits the whole request and is never retried; a known wait that exceeds the remaining budget rejects immediately.
+
+Additional Undici request options such as `query`, `maxRedirections` and `reset` pass through to `undiciTransport`. `throwOnError` is excluded so CallPool can apply its error policy. Other transports ignore unsupported native options.
+
+#### Responses
+
+- `application/json` and `+json` media types are parsed as JSON. Text and missing `Content-Type` return a string; binary media types return a `Buffer`.
+- Use `binary: true` for files when the server's content type may be wrong. Error bodies remain textual.
+- Empty `HEAD`, `204`, `205` and `304` responses return `undefined`, or an empty `Buffer` in binary mode. Other empty or malformed JSON responses reject.
+- `response: "raw"` adds status and headers without changing parsing or error handling. `Set-Cookie` is redacted unless `exposeCookies: true`; error headers always stay redacted.
+
+The generic `T` describes the expected body type; it does not validate the response. Use `request<void>()` for an empty response. Literal `response: "raw"` returns `CallPoolResponse<T>`; options typed as `RequestOptions` return `T | CallPoolResponse<T>` when the mode is unknown.
+
+#### Errors
+
+| Error | Details |
+| --- | --- |
+| `CallPoolError` | HTTP failures expose `statusCode`, `body`, redacted `headers`, `retryable`, `retryAfterMs` and any `resolvedStatus` |
+| `CallPoolTimeoutError` | Total budget exhausted; extends `CallPoolError`, exposes `maxElapsedTime`, never retried |
+| Transport error | Network failures retain the client's original error; Fetch attempt timeouts use `TransportTimeoutError` |
+| Cancellation | Rejects with `signal.reason`, never retried; an active attempt keeps its slot until the transport settles |
+
+## Pool methods
+
+| Method | Description |
+| --- | --- |
+| `request<T>(path, options?)` | Queue a request and resolve with its parsed body or raw response |
+| `close()` | Reject queued requests, wait for active work, then close the transport |
+| `getCurrentConcurrency()` | Current concurrency limit, including adaptive adjustments |
+| `getStats()` | Snapshot of `{ queued, running, concurrency, pausedFor, circuitBreaker }` |
+
+Circuit state is `"disabled"`, `"closed"`, `"open"` or `"half-open"`. `pausedFor` is the remaining open wait in milliseconds, or `0` otherwise.
+
+## Migration notes
+
+### 0.9.x to 0.10.0
+
+Move top-level `network` to `transport: undiciTransport({ network })`. The old option still works, is deprecated, cannot be combined with `transport`, and will be removed in 1.0. Pools without `transport` continue using Undici.
+
+`headersTimeout` and `bodyTimeout` remain available for Undici; `request(path, { timeout })` works with every transport.
+
+### 0.7.x to 0.8.0
+
+| Previous configuration | Replacement |
+| --- | --- |
+| `network.proxy` | `network.uri` |
 | `network.timeout` | `network.headersTimeout` and `network.bodyTimeout` |
-| `network.defaultHeaders` | top-level `defaultHeaders` |
+| `network.defaultHeaders` | Top-level `defaultHeaders` |
 | `network.tls` | `network.connect` directly, or `network.requestTls` through a proxy |
-| `CallPoolTlsOptions` | Undici's native connector/TLS types; `NetworkOptions` is exported |
-| `adaptive.rateLimitSignal.pause` | `circuitBreaker.enabled` enables shared protection with controlled recovery |
-| `rateLimit: { minTime, quota }` | Add `rateLimit.enabled: true` to apply either constraint |
+| `CallPoolTlsOptions` | Native Undici TLS types; `NetworkOptions` is exported |
+| `adaptive.rateLimitSignal.pause` | `circuitBreaker.enabled` |
+| `rateLimit: { minTime, quota }` | Add `rateLimit.enabled: true` |
+| Draft `retry.maxElapsedTime` / `retry.pauseCodes` | Top-level `maxElapsedTime` / `circuitBreaker` |
 
-The removed configuration keys throw a migration error for JavaScript callers instead of being silently ignored. If you used the unreleased `retry.maxElapsedTime` option, move it to top-level `maxElapsedTime` (also available per request). The draft `retry.pauseCodes` option was replaced by `circuitBreaker`; it is rejected at runtime and by TypeScript. Retry/breaker code overlap is intentionally allowed.
-
-**Behavior changes:**
-
-- `rateLimit` now requires `enabled: true`; spacing and quota are off by default, even if their values are supplied. Configuration values are still validated when disabled.
-- `403` is now retried by default alongside 408, 429 and 5xx. Custom `retry.codes` replaces this list.
-- The circuit breaker defaults to off, including with `adaptive.rateLimitSignal: true`. That adaptive option only controls concurrency reduction/recovery. To react to the first 429 pool-wide, use `circuitBreaker: { enabled: true, codes: [429], failureThreshold: 1 }`. Recovery now goes through half-open probes, instead of releasing the full queue when a timer expires.
-- Without a valid `Retry-After`, retry waits use the same configurable fallback for every failure: 1s, 2s, 4s… capped by `maxDelay`, instead of the hidden 5s fallback for 429. Set `retry.delay: 5000` for a 5s initial retry. The circuit's separate fallback is `halfOpen.after` (10s by default), without implicit escalation.
-- Valid `Retry-After` is honored for configured HTTP failures other than 429. Retry and circuit waits use their respective caps independently.
-
-Native options are tied to the installed Undici major version (currently 6.x). No changes are required in the proxy server to configure client connection reuse.
-
-## Request
-
-Options for individual requests passed to the `request()` method.
-
-**Note**: Response parsing is automatic. The media type in `Content-Type` is matched case-insensitively, ignoring parameters such as `charset`. `application/json` and types ending in `+json` (such as `application/vnd.api+json`) are parsed as JSON. Textual media types and responses without `Content-Type` return a string; binary media types return a byte-preserving `Buffer`. Request bodies that are JavaScript objects are automatically serialized to JSON with the appropriate `Content-Type` header.
-
-Empty responses to `HEAD`, or with status `204`, `205`, or `304`, resolve with `undefined` (also as `body` in raw mode). With `binary: true`, they resolve with an empty `Buffer`. Other empty or malformed JSON responses still reject with a non-retryable `CallPoolError`. Use `request<void>()` when no content is expected, or include `undefined` in the body type when an endpoint can return either content or no content. HTTP errors still reject, including on `HEAD` requests.
-
-**Fetching files**: a server that omits `Content-Type`, or labels a picture as text, would have its body decoded as UTF-8 and its bytes lost. Pass `binary: true` when you know you are downloading a file — the response then resolves as a `Buffer` whatever the header says, and JSON parsing is skipped. Error bodies stay textual, so a failure message is still readable.
-
-```typescript
-const image = await pool.request<Buffer>("/photos/1.jpg", { binary: true });
-```
-
-### Example
-
-```typescript
-const pool = new CallPool({
-    baseUrl: "https://api.example.com",
-});
-
-// GET request with high priority
-const data = await pool.request("/data", {
-    priority: 1,
-});
-
-// POST request with custom headers
-// Body objects are automatically serialized to JSON
-const result = await pool.request("/users", {
-    method: "POST",
-    body: { name: "John", email: "john@example.com" },
-    headers: {
-        "X-Custom-Header": "value",
-    },
-});
-
-// PUT request
-// Response JSON is automatically parsed for application/json and +json media types
-await pool.request("/users/123", {
-    method: "PUT",
-    body: { name: "Jane" },
-});
-```
-
-### TypeScript Types
-
-The `request()` method supports TypeScript generics for full type safety:
-
-```typescript
-// Define your types
-interface User {
-    id: number;
-    name: string;
-    email: string;
-}
-
-interface ApiResponse<T> {
-    data: T;
-    status: string;
-}
-
-const pool = new CallPool({
-    baseUrl: "https://api.example.com",
-});
-
-// Type-safe request - TypeScript infers the return type
-const users = await pool.request<User[]>("/users");
-// users is typed as User[]
-
-const user = await pool.request<User>("/users/123");
-// user is typed as User
-
-const response = await pool.request<ApiResponse<User>>("/users/123");
-// response is typed as ApiResponse<User>
-// response.data is typed as User
-
-// POST with typed response
-const newUser = await pool.request<User>("/users", {
-    method: "POST",
-    body: { name: "John", email: "john@example.com" },
-});
-// newUser is typed as User
-```
-
-### Options
-
-| Option          | Type                                               | Required | Default  | Description                                                     |
-| --------------- | -------------------------------------------------- | -------- | -------- | --------------------------------------------------------------- |
-| `method`        | `HttpMethod`                                       | No       | `"GET"`  | HTTP method (GET, POST, PUT, DELETE, etc.)                      |
-| `priority`      | `number`                                           | No       | `5`      | Queue priority (0-9, lower numbers run first; 0 is highest)     |
-| `body`          | `string \| Buffer \| Uint8Array \| object \| null` | No       | -        | Request body (JS objects are automatically serialized to JSON)  |
-| `headers`       | `Record<string, string>`                           | No       | -        | Additional headers for the single request                       |
-| `signal`        | `AbortSignal \| null`                              | No       | -        | Cancels queued work, quota/minTime waits, HTTP and retries        |
-| `response`      | `"body" \| "raw"`                                  | No       | `"body"` | `"raw"` resolves with a `{ status, headers, body }` envelope    |
-| `exposeCookies` | `boolean`                                          | No       | `false`  | Reveals `Set-Cookie` in the raw envelope (redacted by default)  |
-| `resolveStatus` | `ResolveStatus`                                    | No       | pool's   | Overrides the pool's [status resolution](#status-resolution)    |
-
-Header names are matched case-insensitively: request headers override `network.defaultHeaders`, so `authorization` replaces a default `Authorization`. If the same name appears with different casing within either object, the last entry wins. Each header name is sent once, and the input objects are left untouched.
-
-Every other [undici `RequestOptions`](https://github.com/nodejs/undici/blob/main/docs/docs/api/Dispatcher.md#parameter-requestoptions) field (`query`, `maxRedirections`, `idempotent`, `headersTimeout`, ...) is passed through 1:1, except `throwOnError`, which is excluded because it would bypass the pool's error and retry policy.
-
-### Raw Responses
-
-By default `request()` resolves with the parsed body alone. With `response: "raw"` it resolves with the full envelope — same parsing rules, same error/retry semantics (4xx/5xx still reject with `CallPoolError`):
-
-```typescript
-const res = await pool.request<LoginPage>("/login", { response: "raw" });
-// res: { status: number, resolvedStatus?: number, headers: Record<string, ...>, body: LoginPage }
-// resolvedStatus is present only when resolveStatus replaced the real status
-
-// 3xx responses do not throw and redirects are not followed by default,
-// so raw mode lets you walk a redirect chain manually:
-if (res.status === 302) {
-    const next = res.headers["location"];
-}
-```
-
-When options are held in a variable typed as `RequestOptions`, `request<T>()` returns `Promise<T | CallPoolResponse<T>>` because `response` can be either mode. Literal `response: "raw"` still returns `Promise<CallPoolResponse<T>>`; literal `"body"` or omitted options return `Promise<T>`.
-
-`Set-Cookie` is redacted everywhere by default so session cookies can't leak through logged responses or errors. When the cookie **is** the data (e.g. session bootstrap), opt in per request:
-
-```typescript
-const res = await pool.request("/auth", { response: "raw", exposeCookies: true });
-const cookies = res.headers["set-cookie"]; // real value(s)
-```
-
-Headers attached to `CallPoolError` stay redacted even with `exposeCookies: true`.
-
-## Adaptive Throttling
-
-Adaptive throttling is **disabled by default**. To enable it, set `adaptive.enabled` to `true`.
-
-When enabled, the pool automatically monitors request latency and slows down when congestion is detected:
-
--   Calculates an exponential moving average (EMA) of latency
--   If requests are slower than the average multiplied by `adaptive.congestionRatio` for `adaptive.breachLimit` consecutive samples, it reduces concurrency
--   When requests become fast again, it restores concurrency gradually
-
-With `adaptive.useTTFB: true` (the default), the controller receives the latency sample as soon as non-error response headers arrive, so scheduling can adapt while the body is still downloading. With `false`, the sample is recorded after the complete body download, before parsing. Each attempt contributes at most one sample; 4xx/5xx responses are excluded (with [`resolveStatus`](#status-resolution), the resolved status decides, once the body is read). In TTFB mode, a recorded sample is retained even if the subsequent body download fails.
-
-Requests keep their concurrency slot until they finish, including body consumption and retries. Scheduler updates retain the existing 250 ms tuning interval.
-
-### Rate-limit signal
-
-The latency controller samples successful responses only, so on its own it never sees a 429: the refused request waits its `Retry-After`, and the other slots keep sending at full concurrency. With `adaptive.rateLimitSignal` a 429 steers the whole pool instead:
-
--   **One cut per episode**: concurrency is multiplied by `decreaseFactor` (never below `minConcurrency`, always at least one slot) and applied at once, without the tuning debounce. Every 429 received before the episode's wait is over extends it without cutting again, so the requests already in flight when the server starts refusing do not drive concurrency to its floor together.
--   **Separate circuit policy**: `circuitBreaker` controls shared waiting and probes independently of this signal and of `adaptive.enabled`.
--   **Recovery hold**: after the last 429 the controller may grow concurrency again only after `recoveryAfter` successful responses; until then the fast responses that would normally signal headroom do not.
-
-The concurrency signal requires `adaptive.enabled`; it is ignored otherwise. Shared pauses do not require either option.
-
-```typescript
-const pool = new CallPool({
-    baseUrl: "https://portal.example.com",
-    concurrency: { limit: 10 },
-    adaptive: { enabled: true, minConcurrency: 1, rateLimitSignal: { decreaseFactor: 0.5, recoveryAfter: 20 } },
-});
-```
-
-## Introspection
-
--   `pool.getCurrentConcurrency()`: current concurrency limit (the live adaptive value when adaptive throttling is enabled)
--   `pool.getStats()`: live snapshot of the pool — `{ queued, running, concurrency, pausedFor, circuitBreaker }`
--   `circuitBreaker` is `"disabled"`, `"closed"`, `"open"` or `"half-open"`. `pausedFor` is the remaining open wait; it is 0 during half-open even while probe capacity is occupied.
-
-## Error Handling
-
--   **429 (Rate Limit)**: Automatically detects `Retry-After` header and waits exactly that long (capped at `retry.maxRetryAfter`, default 60s) before retrying — no extra backoff is stacked on top. `circuitBreaker` optionally suspends other attempts and controls recovery; `adaptive.rateLimitSignal` separately reduces concurrency (see [Rate-limit signal](#rate-limit-signal))
--   **5xx (Server Error) and 408 (Request Timeout)**: Automatic retry with exponential backoff
--   **403 (Forbidden)**: Retried by default and included in the default circuit selectors when the breaker is enabled
--   **Other 4xx (Client Error)**: No retry by default; configurable with `retry.codes`
--   **Network Error**: Automatic retry with exponential backoff unless `retry.networkErrors: false`
--   **Invalid local request arguments**: Propagated immediately without retry
--   **AbortSignal**: Pass an optional `signal` to cancel a logical request, including scheduler queue, quota/`minTime` waits, HTTP/body download, and retry backoff. The rejection preserves `signal.reason`, and an aborted request is never retried. Cancelling while queued removes the job promptly; cancelling while waiting for rate permission releases its concurrency slot without charging that pending permission. An active HTTP attempt keeps its slot until the transport settles. Abort listeners and unused rate wake timers are removed when their waits end.
-
-```typescript
-const controller = new AbortController();
-const pending = pool.request("/report", { signal: controller.signal });
-controller.abort(new Error("Report no longer needed"));
-
-try {
-    await pending;
-} catch (error) {
-    if (error !== controller.signal.reason) throw error;
-}
-```
-
-HTTP-level failures are thrown as `CallPoolError`, which exposes the response details:
-
-```typescript
-import { CallPool, CallPoolError } from "call-pool";
-
-try {
-    await pool.request("/users/999");
-} catch (err) {
-    if (err instanceof CallPoolError) {
-        err.statusCode; // e.g. 404
-        err.resolvedStatus; // number or name from resolveStatus, when it replaced statusCode
-        err.body; // raw response body
-        err.headers; // response headers (Set-Cookie redacted)
-        err.retryable; // whether policy permits retry, subject to attempts/budget
-        err.retryAfterMs; // parsed/capped valid Retry-After, otherwise undefined
-    }
-}
-```
-
-Network-level failures (DNS, connection reset, socket timeout) propagate as the original `undici` errors.
-
-**Backpressure note**: retry waits (backoff and `Retry-After`) happen while the logical request still occupies its concurrency slot. A retrying request therefore slows the whole pool down — intentional backpressure that prevents hammering a struggling upstream. Rate limits are acquired separately for every HTTP attempt, so retries count against `minTime` and quota just like initial attempts.
+Removed keys throw a migration error. Rate limits and the circuit breaker are disabled by default. The adaptive rate-limit signal now adjusts concurrency only; enable the circuit breaker for shared pauses. Retries now include 403 by default and use a 1-second initial backoff, including for 429 without a valid `Retry-After`. Valid `Retry-After` also applies to other configured HTTP failures.
 
 ## Dependencies
 
--   `undici`: High-performance HTTP connection pool
+- `undici`: default HTTP transport.
+- `impit`: optional peer dependency, only needed for `call-pool/impit`.
 
-Rate limiting, priority queueing and quota management are implemented in-process with zero additional dependencies.
+Scheduling, rate limits and quotas have no additional dependencies.
 
 ## TODO
 
-Funzionalità pianificate per le prossime versioni:
-
--   **Sistema di monitoraggio UI locale**: Interfaccia web avviata localmente per monitorare in tempo reale:
-    -   Velocità di scodamento delle richieste per ogni pool
-    -   Log delle richieste e degli errori
-    -   Latenze medie, minime e massime per ogni pool
-    -   Statistiche su rate limiting, retry e throttling
-    -   Grafici e metriche in tempo reale
+- Local monitoring UI with per-pool throughput, request and error logs, latency statistics, rate-limit/retry/throttling metrics and live charts.
 
 ## License
 
 MIT
-
-## Development checks
-
-```sh
-pnpm typecheck
-pnpm test:run       # Unit, integration, local end-to-end and compile-only API tests
-pnpm test:e2e       # HTTPS/CONNECT and 429 recovery end-to-end only
-```
-
-The end-to-end suite requires `openssl` to generate temporary certificates. It starts loopback-only fixtures on ephemeral test ports and does not contact external portals or paid proxies. It verifies actual tunnel reuse and reconnection, TLS trust on each hop, timeout overrides, 429 queue behavior and 403 half-open recovery; it does not claim to verify provider public-IP rotation.

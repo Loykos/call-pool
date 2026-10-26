@@ -1,13 +1,15 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import { Pool, ProxyAgent, errors } from "undici";
-import { CallPoolOptions, CallPoolResponse, CallPoolStats, NetworkOptions, StatusCodeSelector, RateLimitSignalOptions, RequestOptions, ResolveStatus } from "./types.js";
+import { CallPoolOptions, CallPoolResponse, CallPoolStats, StatusCodeSelector, RateLimitSignalOptions, RequestOptions, ResolveStatus } from "./types.js";
 import { CallPoolError, PoolClosedError } from "./errors.js";
 import { RateGate } from "./rate-gate.js";
 import { RequestScheduler } from "./scheduler.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { isNamedStatus, matchesCode, parseRetryAfter } from "./http-policy.js";
 import { RequestDeadline } from "./request-deadline.js";
-import { validateOptions, validateMaxElapsedTime, validateResolveStatus } from "./validation.js";
+import { validateOptions, validateMaxElapsedTime, validateResolveStatus, validateTimeout } from "./validation.js";
+import type { Transport } from "./transports/transport.js";
+import { undiciTransport } from "./transports/undici.js";
+import { untilAborted } from "./abort.js";
 
 /** Per-request options left after the pool-level keys are extracted. */
 type TransportOptions = Omit<RequestOptions, "priority" | "response" | "exposeCookies" | "maxElapsedTime" | "resolveStatus">;
@@ -17,9 +19,9 @@ type ResponseHeaders = Record<string, string | string[] | undefined>;
 const RATE_LIMIT_SIGNAL_DEFAULTS: Required<RateLimitSignalOptions> = { decreaseFactor: 0.5, recoveryAfter: 10 };
 
 export class CallPool {
-    private client: Pool | ProxyAgent;
-    /** Set only when proxied: ProxyAgent needs the target origin on every request. */
-    private proxiedOrigin: string | null = null;
+    /** How requests reach the host: `options.transport`, Undici by default. */
+    private client: Transport;
+    private baseUrl: URL;
     private scheduler: RequestScheduler;
     private rateGate: RateGate | null;
 
@@ -72,8 +74,8 @@ export class CallPool {
 
     /**
      * Creates a pool bound to a single base URL. Validates `options` synchronously
-     * before any socket or limiter is created. Native transport options are
-     * validated by Undici, sometimes lazily on the first request.
+     * before any socket or limiter is created. Transport options are validated by
+     * the transport: Undici's sometimes lazily, on the first request.
      *
      * @param options - Pool configuration; see {@link CallPoolOptions}.
      * @throws {Error} When `options` fails validation (e.g. missing/invalid `baseUrl`,
@@ -119,8 +121,10 @@ export class CallPool {
         // start at the maximum.
         this.currentConcurrency = this.adaptiveEnabled ? (adaptOpts?.initialConcurrency ?? this.maxConcurrency) : this.maxConcurrency;
 
-        // --- 4. SETUP UNDICI & SCHEDULER ---
-        this.client = this.createClient(options.baseUrl, concurrencyLimit, options.network);
+        // --- 4. SETUP TRANSPORT & SCHEDULER ---
+        this.baseUrl = new URL(options.baseUrl);
+        const transport = options.transport ?? undiciTransport({ network: options.network });
+        this.client = transport({ origin: this.baseUrl.origin, connections: concurrencyLimit });
         this.scheduler = new RequestScheduler({ maxConcurrent: this.currentConcurrency });
         const minTime = this.computeBaseMinTime(rateOpts);
         // The gate admits circuit probes atomically with quota/spacing, so it
@@ -139,15 +143,6 @@ export class CallPool {
         if (rateOpts?.minTime !== "auto") return rateOpts?.minTime ?? 0;
         if (!rateOpts.quota) throw new Error("[CallPool] 'auto' requires 'quota'");
         return Math.ceil(rateOpts.quota.window / rateOpts.quota.max);
-    }
-
-    private createClient(baseUrl: string, connections: number, network?: NetworkOptions): Pool | ProxyAgent {
-        const defaults = { connections, pipelining: 1, keepAliveTimeout: 10_000, headersTimeout: 30_000, bodyTimeout: 30_000 };
-        if (network && "uri" in network && network.uri !== undefined) {
-            this.proxiedOrigin = new URL(baseUrl).origin;
-            return new ProxyAgent({ ...defaults, ...network });
-        }
-        return new Pool(baseUrl, { ...defaults, ...network });
     }
 
     /**
@@ -188,6 +183,7 @@ export class CallPool {
         }
         if (this.closePromise) throw new PoolClosedError();
         validateMaxElapsedTime(maxElapsedTime);
+        validateTimeout(reqOpts.timeout);
         validateResolveStatus(resolveStatus, "resolveStatus");
         const callerSignal = reqOpts.signal instanceof AbortSignal ? reqOpts.signal : undefined;
         const deadline = maxElapsedTime === undefined ? undefined : new RequestDeadline(maxElapsedTime, callerSignal);
@@ -197,7 +193,10 @@ export class CallPool {
             // it: do not add another job behind the blocked scheduler slots.
             deadline?.assertCanWait(this.rateGate?.pausedFor() ?? 0);
             const transportOptions = deadline ? { ...reqOpts, signal } : reqOpts;
-            const envelope = await this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, transportOptions, exposeCookies, resolveStatus, deadline), signal);
+            const job = this.scheduler.schedule(priority, () => this.executeWithRetry<T>(path, transportOptions, exposeCookies, resolveStatus, deadline), signal);
+            // The caller settles at its abort; the job keeps its slot, and close(),
+            // until the transport settles: a client may not stop a request at once (impit).
+            const envelope = await untilAborted(job, signal);
             return response === "raw" ? envelope : envelope.body;
         } finally {
             deadline?.dispose();
@@ -230,6 +229,8 @@ export class CallPool {
                 }
                 const retryable = this.isRetryableError(err);
                 if (!retryable || attempt >= this.maxAttempts) throw err;
+                // A stalled rotation must not outlive the caller's signal or maxElapsedTime
+                await untilAborted(this.client.rotate?.({ attempt, status: err instanceof CallPoolError ? err.resolvedStatus ?? err.statusCode : undefined, error: err }), signal);
 
                 // An HTTP failure may carry a capped Retry-After wait, honored
                 // as-is instead of stacking the backoff delay on top of it.
@@ -254,15 +255,14 @@ export class CallPool {
     private isRetryableError(err: unknown): boolean {
         if (err instanceof CallPoolError) return err.retryable;
         if (err instanceof PoolClosedError) return false;
-        if (err instanceof errors.InvalidArgumentError || err instanceof errors.InvalidReturnValueError) return false;
-        if (err instanceof errors.RequestAbortedError) return false;
+        if (this.client.isFatal?.(err)) return false;
         return this.retryNetworkErrors;
     }
 
     private async executeOnce<T>(path: string, reqOpts: TransportOptions, exposeCookies: boolean, resolveStatus: ResolveStatus | undefined, deadline?: RequestDeadline): Promise<CallPoolResponse<T>> {
-        const { body: requestBody, headers: requestHeaders, method = "GET", binary = false, ...dispatcherOptions } = reqOpts;
+        const { body: requestBody, headers: requestHeaders, method = "GET", binary = false, signal: _signal, timeout, ...transportOptions } = reqOpts;
         // The type-level Omit doesn't stop plain-JS callers: drop the key for real.
-        delete (dispatcherOptions as { throwOnError?: boolean }).throwOnError;
+        delete (transportOptions as { throwOnError?: boolean }).throwOnError;
         let body = requestBody;
         const headers = this.mergeHeaders(requestHeaders);
 
@@ -284,15 +284,19 @@ export class CallPool {
             if (this.closePromise) throw new PoolClosedError();
             deadline?.assertCanWait(0);
             const start = performance.now();
+            const origin = this.baseUrl.origin;
             const response = await this.client.request({
-                ...dispatcherOptions,
-                // A Pool is bound to its origin; a ProxyAgent is origin-agnostic
-                // and must be told the tunnel target on every request.
-                ...(this.proxiedOrigin ? { origin: this.proxiedOrigin } : {}),
                 path,
+                // Built only by transports that read it: Undici takes `path` and keeps its own validation.
+                get url() {
+                    return originUrl(origin, path);
+                },
                 method,
                 headers,
-                body: body as string | Buffer | Uint8Array | null,
+                body: body as string | Buffer | Uint8Array | null | undefined,
+                signal,
+                timeout,
+                options: transportOptions,
             });
 
             const ttfb = performance.now() - start;
@@ -594,4 +598,16 @@ export class CallPool {
         await this.scheduler.stop();
         await this.client.close();
     }
+}
+
+/**
+ * `path` on the pool's origin, for transports that take a full URL. The URL is
+ * built by concatenation, so "//host", "\\host" or an absolute URL can never
+ * name another host; a path that does not start with "/" is rejected, as Undici
+ * rejects it. Never retried: every attempt would fail the same way.
+ */
+function originUrl(origin: string, path: string): URL {
+    const url = path.startsWith("/") ? new URL(origin + path) : undefined;
+    if (url?.origin === origin) return url;
+    throw new CallPoolError(`[CallPool] path must start with "/" and stay on ${origin}: ${path.slice(0, 100)}`, { retryable: false });
 }

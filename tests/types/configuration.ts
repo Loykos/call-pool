@@ -1,5 +1,6 @@
 import type { Pool, ProxyAgent } from "undici";
-import { CallPool, type CallPoolOptions, type NetworkOptions, type RequestOptions } from "../../src/index.js";
+import { CallPool, fetchTransport, undiciTransport, type CallPoolOptions, type NetworkOptions, type RequestOptions, type TransportFactory } from "../../src/index.js";
+import { impitTransport } from "../../src/transports/impit.js";
 
 declare const direct: Pool.Options;
 declare const proxy: ProxyAgent.Options;
@@ -46,3 +47,13 @@ const booleanResolver: CallPoolOptions = { baseUrl: "http://example.com", resolv
 const oldPauseCodes: CallPoolOptions = { baseUrl: "http://example.com", retry: { pauseCodes: [429] } };
 // @ts-expect-error Circuit breakers always wait; no onOpen switch.
 const unsupportedOnOpen: CallPoolOptions = { baseUrl: "http://example.com", circuitBreaker: { onOpen: "reject" } };
+new CallPool({ baseUrl: "https://example.com", transport: undiciTransport({ network: proxyOptions }) });
+new CallPool({ baseUrl: "https://example.com", transport: fetchTransport(fetch) });
+new CallPool({ baseUrl: "https://example.com", transport: fetchTransport({ create: async () => fetch }, { rotateOn: ({ status }) => status === 403 }) });
+new CallPool({ baseUrl: "https://example.com", transport: impitTransport({ browser: "chrome", proxyUrl: async () => "http://proxy.example.com:3128" }) });
+const ownTransport: TransportFactory = () => ({
+    request: async () => ({ statusCode: 200, headers: {}, body: { text: async () => "", arrayBuffer: async () => new ArrayBuffer(0) } }),
+    close: async () => {},
+});
+new CallPool({ baseUrl: "https://example.com", transport: ownTransport });
+pool.request("/", { timeout: 1000 });

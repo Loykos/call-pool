@@ -1,9 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { CallPool, type CallPoolOptions } from "../../src/index";
+import { CallPool, undiciTransport, type CallPoolOptions, type UndiciTransportOptions } from "../../src/index";
 
 describe("0.8 configuration migration guards", () => {
     it.each(["tls", "proxy", "timeout", "defaultHeaders"])("rejects removed network.%s for JavaScript callers", key => {
         expect(() => new CallPool({ baseUrl: "http://localhost", network: { [key]: {} } } as CallPoolOptions))
+            .toThrow(`'network.${key}' was removed in 0.8`);
+    });
+
+    it.each(["tls", "proxy", "timeout", "defaultHeaders"])("rejects removed network.%s inside undiciTransport too", key => {
+        expect(() => undiciTransport({ network: { [key]: {} } } as UndiciTransportOptions))
             .toThrow(`'network.${key}' was removed in 0.8`);
     });
 

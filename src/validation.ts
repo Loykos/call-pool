@@ -1,5 +1,5 @@
 import { isNamedStatus } from "./http-policy.js";
-import { CallPoolOptions, StatusCodeSelector } from "./types.js";
+import { CallPoolOptions, NetworkOptions, StatusCodeSelector } from "./types.js";
 
 export function validateOptions(options: CallPoolOptions): void {
     if (!options || typeof options.baseUrl !== "string" || options.baseUrl.length === 0) {
@@ -17,15 +17,14 @@ export function validateOptions(options: CallPoolOptions): void {
         throw new Error("[CallPool] 'concurrency.limit' must be a positive integer");
     }
 
+    if (options.transport !== undefined && typeof options.transport !== "function") {
+        throw new Error("[CallPool] 'transport' must be a transport factory, e.g. undiciTransport()");
+    }
+    if (options.transport !== undefined && options.network !== undefined) {
+        throw new Error("[CallPool] 'network' cannot be combined with 'transport': use undiciTransport({ network })");
+    }
     validateMaxElapsedTime(options.maxElapsedTime);
     validateResolveStatus(options.resolveStatus, "resolveStatus");
-    // Removed aliases must not silently bypass proxy/TLS/timeout configuration
-    // for JavaScript consumers migrating from 0.7.
-    for (const key of ["timeout", "defaultHeaders", "tls", "proxy"]) {
-        if (options.network && key in options.network) {
-            throw new Error(`[CallPool] 'network.${key}' was removed in 0.8; use native Undici options (see migration guide)`);
-        }
-    }
     if (options.retry && "maxElapsedTime" in options.retry) {
         throw new Error("[CallPool] 'retry.maxElapsedTime' moved to 'maxElapsedTime'");
     }
@@ -33,6 +32,25 @@ export function validateOptions(options: CallPoolOptions): void {
     validateRetryOptions(options.retry);
     validateAdaptiveOptions(options.adaptive, concurrencyLimit);
     validateCircuitBreaker(options.circuitBreaker);
+}
+
+/**
+ * Removed aliases must not silently bypass proxy/TLS/timeout configuration for
+ * JavaScript consumers migrating from 0.7, whether `network` is top-level or
+ * handed to `undiciTransport`.
+ */
+export function validateNetwork(network: NetworkOptions | undefined): void {
+    for (const key of ["timeout", "defaultHeaders", "tls", "proxy"]) {
+        if (network && key in network) {
+            throw new Error(`[CallPool] 'network.${key}' was removed in 0.8; use native Undici options (see migration guide)`);
+        }
+    }
+}
+
+export function validateTimeout(value: number | undefined): void {
+    if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+        throw new Error("[CallPool] 'timeout' must be a positive finite number");
+    }
 }
 
 export function validateMaxElapsedTime(value: number | undefined): void {
